@@ -1,10 +1,5 @@
 # AtlasFarm
 
-[![License](https://shields.io)](LICENSE)
-[![Go Version](https://shields.io)](https://go.dev)
-[![Kubernetes](https://shields.io)](deploy/k8s/)
-[![Prometheus](https://shields.io)](deploy/observability/)
-
 **AtlasFarm** is a distributed, hardware-aware job orchestration and build-farm control plane written in **Go (Golang)**. Modeled after large-scale internal CI, verification, and compute farms, it schedules heterogeneous workloads across containerized worker fleets with lock-free task claiming, lease-based crash recovery, and automated SLO-driven canary rollbacks.
 
 > **Demo Walkthrough:** `[Add your 3-minute Loom / YouTube demo link here]`
