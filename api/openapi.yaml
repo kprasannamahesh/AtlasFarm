@@ -2,13 +2,13 @@ openapi: 3.0.3
 info:
   title: AtlasFarm Control Plane API
   version: 1.0.0
-  description: Job submission and worker lifecycle APIs.
+  description: Job submission, fenced worker lifecycle, and lease APIs.
 servers:
   - url: http://localhost:8080
 paths:
   /v1/jobs:
     post:
-      summary: Create an idempotent job and publish it to the worker queue
+      summary: Create an idempotent job for fair scheduling
       parameters:
         - in: header
           name: Idempotency-Key
@@ -24,13 +24,13 @@ paths:
               $ref: '#/components/schemas/CreateJob'
       responses:
         '201':
-          description: Job created and published
+          description: Job created and queued
         '200':
-          description: Existing idempotent job published again
+          description: Existing idempotent job returned
         '400':
           description: Invalid request
-        '503':
-          description: Message broker unavailable
+        '429':
+          description: Tenant quota exceeded
     get:
       summary: List recent jobs
       responses:
@@ -38,7 +38,7 @@ paths:
           description: Jobs
   /v1/jobs/{job_id}:
     get:
-      summary: Get a job
+      summary: Get a job projection and chronological event audit trail
       parameters:
         - $ref: '#/components/parameters/JobID'
       responses:
@@ -46,9 +46,20 @@ paths:
           description: Job
         '404':
           description: Job not found
+    delete:
+      summary: Cancel an active job
+      parameters:
+        - $ref: '#/components/parameters/JobID'
+      responses:
+        '200':
+          description: Job cancelled
+        '404':
+          description: Job not found
+        '409':
+          description: Job is already terminal
   /v1/jobs/{job_id}/status:
     post:
-      summary: Claim a queued job or report its terminal outcome
+      summary: Claim a scheduled job or report its terminal outcome with a fencing token
       parameters:
         - $ref: '#/components/parameters/JobID'
       requestBody:
@@ -63,7 +74,7 @@ paths:
         '404':
           description: Job not found
         '409':
-          description: Invalid transition
+          description: Invalid transition or stale execution token
   /v1/workers:
     post:
       summary: Register or refresh worker capacity
@@ -83,16 +94,30 @@ paths:
           description: Workers
   /v1/workers/{worker_id}/heartbeat:
     post:
-      summary: Record worker liveness
+      summary: Record worker liveness and renew active execution leases
       parameters:
         - in: path
           name: worker_id
           required: true
           schema:
             type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active_jobs]
+              properties:
+                active_jobs:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/ActiveLease'
       responses:
         '200':
           description: Heartbeat accepted
+        '400':
+          description: Invalid active lease list
         '404':
           description: Worker not found
 components:
@@ -116,27 +141,30 @@ components:
           description: Optional when the Idempotency-Key request header is provided.
         command:
           type: string
-        cpu:
+        req_cpu:
           type: integer
           minimum: 1
           default: 1
-        memory_mb:
+        req_memory_mb:
           type: integer
           minimum: 1
           default: 1024
-        gpu:
+        req_gpu:
           type: integer
           minimum: 0
           default: 0
     JobStatus:
       type: object
-      required: [status, worker_id]
+      required: [status, worker_id, execution_id]
       properties:
         status:
           type: string
           enum: [running, succeeded, failed]
         worker_id:
           type: string
+        execution_id:
+          type: integer
+          format: int64
         result:
           type: string
         error:
@@ -159,3 +187,12 @@ components:
           default: 0
         runner_version:
           type: string
+    ActiveLease:
+      type: object
+      required: [job_id, execution_id]
+      properties:
+        job_id:
+          type: string
+        execution_id:
+          type: integer
+          format: int64

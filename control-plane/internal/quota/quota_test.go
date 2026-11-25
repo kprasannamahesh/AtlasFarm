@@ -2,6 +2,7 @@ package quota
 
 import (
 	"errors"
+	"math"
 	"testing"
 )
 
@@ -40,6 +41,24 @@ func TestCheckQuotaLimits(t *testing.T) {
 			name:    "concurrent job limit breach",
 			usage:   Usage{ConcurrentJobs: 4},
 			request: Request{CPU: 1, MemoryMB: 1},
+			wantErr: true,
+		},
+		{
+			name:    "cpu usage overflow",
+			usage:   Usage{CPU: int(^uint(0) >> 1)},
+			request: Request{CPU: 1, MemoryMB: 1},
+			wantErr: true,
+		},
+		{
+			name:    "memory usage overflow",
+			usage:   Usage{MemoryMB: math.MaxInt64},
+			request: Request{CPU: 1, MemoryMB: 1},
+			wantErr: true,
+		},
+		{
+			name:    "gpu usage overflow",
+			usage:   Usage{GPU: int(^uint(0) >> 1)},
+			request: Request{CPU: 1, MemoryMB: 1, GPU: 1},
 			wantErr: true,
 		},
 	}

@@ -52,8 +52,9 @@ func TestCreateJobIsIdempotent(t *testing.T) {
 	mock.ExpectQuery("WHERE idempotency_key = \\?").WithArgs("request-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "idempotency_key", "command",
 			"req_cpu", "req_memory_mb", "req_gpu", "status", "worker_id", "result", "error_message",
-			"created_at", "updated_at"}).AddRow("job-original", "tenant-1", "request-1",
-			"original", 1, int64(1024), 0, "queued", nil, nil, nil, time.Now(), time.Now()))
+			"created_at", "updated_at", "execution_id", "lease_expires_at"}).AddRow(
+			"job-original", "tenant-1", "request-1", "original", 1, int64(1024), 0,
+			"queued", nil, nil, nil, time.Now(), time.Now(), int64(0), nil))
 	mock.ExpectCommit()
 
 	job, created, err := store.CreateJob(context.Background(), CreateJobRequest{
@@ -65,6 +66,64 @@ func TestCreateJobIsIdempotent(t *testing.T) {
 	}
 	if created || job.ID != "job-original" {
 		t.Fatalf("CreateJob() = (%+v, created=%v), want existing job", job, created)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetJobWithEventsReturnsChronologicalAuditTrail(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := New(db)
+	now := time.Now()
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
+		WillReturnRows(jobRows(now, "job-1", "queued"))
+	mock.ExpectQuery("SELECT sequence_num, event_type, payload, trace_id, created_at").
+		WithArgs("job-1").
+		WillReturnRows(sqlmock.NewRows([]string{"sequence_num", "event_type", "payload", "trace_id", "created_at"}).
+			AddRow(1, "JOB_CREATED", []byte(`{"status":"queued"}`), nil, now).
+			AddRow(2, "JOB_SCHEDULED", []byte(`{"status":"scheduled"}`), nil, now.Add(time.Second)))
+	mock.ExpectCommit()
+
+	job, err := store.GetJobWithEvents(context.Background(), "job-1")
+	if err != nil {
+		t.Fatalf("GetJobWithEvents() error = %v", err)
+	}
+	if len(job.Events) != 2 || job.Events[0].SequenceNum != 1 ||
+		job.Events[1].SequenceNum != 2 || job.Events[1].EventType != "JOB_SCHEDULED" {
+		t.Fatalf("GetJobWithEvents() events = %+v, want ordered creation and scheduling events", job.Events)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestListWorkersScansNullableHeartbeat(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := New(db)
+	lastHeartbeat := time.Now()
+	mock.ExpectQuery("SELECT id, total_cpu").WillReturnRows(
+		sqlmock.NewRows([]string{"id", "total_cpu", "used_cpu", "total_memory_mb", "used_memory_mb",
+			"total_gpu", "used_gpu", "runner_version", "status", "last_heartbeat"}).
+			AddRow("worker-live", 4, 0, int64(8192), int64(0), 0, 0, "test", "online", lastHeartbeat).
+			AddRow("worker-no-heartbeat", 2, 0, int64(4096), int64(0), 0, 0, "test", "offline", nil))
+
+	workers, err := store.ListWorkers(context.Background())
+	if err != nil {
+		t.Fatalf("ListWorkers() error = %v", err)
+	}
+	if len(workers) != 2 || !workers[0].LastHeartbeat.Equal(lastHeartbeat) ||
+		!workers[1].LastHeartbeat.IsZero() {
+		t.Fatalf("ListWorkers() = %+v, want nullable heartbeat timestamps handled", workers)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -88,12 +147,12 @@ func TestScheduleJobReservesWorkerAndAppendsEventTransactionally(t *testing.T) {
 	mock.ExpectQuery("SELECT COALESCE\\(MAX\\(sequence_num\\), 0\\) \\+ 1").
 		WithArgs("job-1").WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(2))
 	mock.ExpectExec("INSERT INTO job_events").
-		WithArgs("job-1", 2, "JOB_SCHEDULED", `{"status":"scheduled","worker_id":"worker-1"}`).
+		WithArgs("job-1", 2, "JOB_SCHEDULED", `{"execution_id":1,"status":"scheduled","worker_id":"worker-1"}`).
 		WillReturnResult(sqlmock.NewResult(2, 1))
 	mock.ExpectExec("UPDATE jobs_projection SET status = 'scheduled'").
 		WithArgs("worker-1", "job-1").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
-		WillReturnRows(jobRowsWithWorker(now, "job-1", "scheduled", "worker-1"))
+		WillReturnRows(jobRowsWithExecution(now, "job-1", "scheduled", "worker-1", 1, now.Add(15*time.Second)))
 	mock.ExpectCommit()
 
 	job, scheduled, err := store.ScheduleJob(context.Background(), "job-1", "worker-1")
@@ -115,11 +174,11 @@ func TestTransitionJobCommitsProjectionAndEventTogether(t *testing.T) {
 	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
-		WillReturnRows(jobRowsWithWorker(now, "job-1", "running", "worker-1"))
+		WillReturnRows(jobRowsWithExecution(now, "job-1", "running", "worker-1", 2, now.Add(15*time.Second)))
 	mock.ExpectQuery("SELECT COALESCE\\(MAX\\(sequence_num\\), 0\\) \\+ 1").
 		WithArgs("job-1").WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(2))
 	mock.ExpectExec("INSERT INTO job_events").
-		WithArgs("job-1", 2, "JOB_COMPLETED", `{"result":"done","status":"succeeded","worker_id":"worker-1"}`).
+		WithArgs("job-1", 2, "JOB_COMPLETED", `{"execution_id":2,"result":"done","status":"succeeded","worker_id":"worker-1"}`).
 		WillReturnResult(sqlmock.NewResult(2, 1))
 	mock.ExpectExec("UPDATE workers SET used_cpu").
 		WithArgs(2, int64(2048), 0, "worker-1").
@@ -128,10 +187,10 @@ func TestTransitionJobCommitsProjectionAndEventTogether(t *testing.T) {
 		WithArgs("succeeded", "worker-1", "done", "", "job-1").
 		WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
-		WillReturnRows(jobRows(now, "job-1", "succeeded"))
+		WillReturnRows(jobRowsWithExecution(now, "job-1", "succeeded", "worker-1", 2, time.Time{}))
 	mock.ExpectCommit()
 
-	job, err := store.TransitionJob(context.Background(), "job-1", "succeeded", "worker-1", "done", "")
+	job, _, err := store.TransitionJobWithExecution(context.Background(), "job-1", "succeeded", "worker-1", 2, "done", "")
 	if err != nil {
 		t.Fatalf("TransitionJob() error = %v", err)
 	}
@@ -143,7 +202,7 @@ func TestTransitionJobCommitsProjectionAndEventTogether(t *testing.T) {
 	}
 }
 
-func TestClaimJobIsExclusiveAndIdempotent(t *testing.T) {
+func TestClaimJobValidatesAndFencesExecutionToken(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
@@ -153,30 +212,119 @@ func TestClaimJobIsExclusiveAndIdempotent(t *testing.T) {
 	now := time.Now()
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
-		WillReturnRows(jobRows(now, "job-1", "queued"))
+		WillReturnRows(jobRowsWithExecution(now, "job-1", "scheduled", "worker-1", 1, now.Add(15*time.Second)))
 	mock.ExpectQuery("SELECT COALESCE\\(MAX\\(sequence_num\\), 0\\) \\+ 1").
 		WithArgs("job-1").WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(2))
 	mock.ExpectExec("INSERT INTO job_events").
-		WithArgs("job-1", 2, "JOB_STARTED", `{"status":"running","worker_id":"worker-1"}`).
+		WithArgs("job-1", 2, "JOB_LEASED", `{"execution_id":2,"status":"leased","worker_id":"worker-1"}`).
 		WillReturnResult(sqlmock.NewResult(2, 1))
+	mock.ExpectQuery("SELECT COALESCE\\(MAX\\(sequence_num\\), 0\\) \\+ 1").
+		WithArgs("job-1").WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(3))
+	mock.ExpectExec("INSERT INTO job_events").
+		WithArgs("job-1", 3, "JOB_STARTED", `{"execution_id":2,"status":"running","worker_id":"worker-1"}`).
+		WillReturnResult(sqlmock.NewResult(3, 1))
 	mock.ExpectExec("UPDATE jobs_projection SET status = 'running'").
 		WithArgs("worker-1", "job-1").WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
-		WillReturnRows(jobRowsWithWorker(now, "job-1", "running", "worker-1"))
+		WillReturnRows(jobRowsWithExecution(now, "job-1", "running", "worker-1", 2, now.Add(15*time.Second)))
 	mock.ExpectCommit()
 
-	job, claimed, err := store.ClaimJob(context.Background(), "job-1", "worker-1")
+	job, claimed, err := store.ClaimJob(context.Background(), "job-1", "worker-1", 1)
 	if err != nil || !claimed || !job.Claimed {
 		t.Fatalf("ClaimJob() = (%+v, claimed=%v, err=%v), want newly claimed job", job, claimed, err)
 	}
 
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
-		WillReturnRows(jobRowsWithWorker(now, "job-1", "running", "worker-1"))
+		WillReturnRows(jobRowsWithExecution(now, "job-1", "running", "worker-1", 2, now.Add(15*time.Second)))
+	mock.ExpectRollback()
+	_, claimed, err = store.ClaimJob(context.Background(), "job-1", "worker-2", 1)
+	if !errors.Is(err, ErrStaleExecution) || claimed {
+		t.Fatalf("stale ClaimJob() = (claimed=%v, err=%v), want ErrStaleExecution", claimed, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStaleExecutionCannotCommitAfterReassignment(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := New(db)
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
+		WillReturnRows(jobRowsWithExecution(time.Now(), "job-1", "running", "worker-new", 4, time.Now().Add(15*time.Second)))
+	mock.ExpectRollback()
+
+	_, _, err = store.TransitionJobWithExecution(
+		context.Background(), "job-1", "succeeded", "worker-old", 2, "stale output", "")
+	if !errors.Is(err, ErrStaleExecution) {
+		t.Fatalf("stale completion error = %v, want ErrStaleExecution", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHeartbeatRenewsOnlySuppliedExecutionLeases(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := New(db)
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE workers SET status = 'online'").
+		WithArgs("worker-1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE jobs_projection SET").
+		WithArgs("job-1", "worker-1", int64(4)).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectCommit()
-	job, claimed, err = store.ClaimJob(context.Background(), "job-1", "worker-2")
-	if err != nil || claimed || job.Claimed {
-		t.Fatalf("duplicate ClaimJob() = (%+v, claimed=%v, err=%v), want not claimed", job, claimed, err)
+
+	if err := store.HeartbeatWithLeases(context.Background(), "worker-1", []ActiveLease{
+		{JobID: "job-1", ExecutionID: 4},
+		{JobID: "job-invalid", ExecutionID: 0},
+	}); err != nil {
+		t.Fatalf("HeartbeatWithLeases() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReapExpiredJobRequeuesAndReleasesResourcesTransactionally(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := New(db)
+	now := time.Now()
+	mock.ExpectQuery("SELECT id FROM jobs_projection").
+		WithArgs(100).WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow("job-1"))
+	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
+		WillReturnRows(jobRowsWithExecution(now, "job-1", "running", "worker-1", 1, now.Add(-time.Second)))
+	mock.ExpectQuery("SELECT COALESCE\\(MAX\\(sequence_num\\), 0\\) \\+ 1").
+		WithArgs("job-1").WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(2))
+	mock.ExpectExec("INSERT INTO job_events").
+		WithArgs("job-1", 2, "JOB_RETRIED",
+			`{"execution_id":1,"reason":"lease expired","status":"queued","worker_id":"worker-1"}`).
+		WillReturnResult(sqlmock.NewResult(2, 1))
+	mock.ExpectExec("UPDATE workers SET used_cpu").
+		WithArgs(2, int64(2048), 0, "worker-1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec("UPDATE jobs_projection SET status").
+		WithArgs("queued", "", 1, "", "job-1").WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	reaped, err := store.ReapExpiredJobs(context.Background(), 3, 100)
+	if err != nil {
+		t.Fatalf("ReapExpiredJobs() error = %v", err)
+	}
+	if len(reaped) != 1 || reaped[0].Status != "queued" || reaped[0].WorkerID != "worker-1" {
+		t.Fatalf("ReapExpiredJobs() = %+v, want recovered queued job", reaped)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatal(err)
@@ -192,10 +340,10 @@ func TestTransitionJobRejectsInvalidStateWithoutAppendingEvent(t *testing.T) {
 	store := New(db)
 	mock.ExpectBegin()
 	mock.ExpectQuery("SELECT id, tenant_id").WithArgs("job-1").
-		WillReturnRows(jobRows(time.Now(), "job-1", "queued"))
+		WillReturnRows(jobRowsWithExecution(time.Now(), "job-1", "running", "worker-1", 1, time.Time{}))
 	mock.ExpectRollback()
 
-	_, err = store.TransitionJob(context.Background(), "job-1", "succeeded", "worker-1", "", "")
+	_, _, err = store.TransitionJobWithExecution(context.Background(), "job-1", "queued", "worker-1", 1, "", "")
 	if !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("TransitionJob() error = %v, want ErrInvalidTransition", err)
 	}
@@ -234,7 +382,7 @@ func expectCreateLookup(mock sqlmock.Sqlmock, now time.Time, id, status string) 
 	emptyJobRows := func() *sqlmock.Rows {
 		return sqlmock.NewRows([]string{"id", "tenant_id", "idempotency_key", "command",
 			"req_cpu", "req_memory_mb", "req_gpu", "status", "worker_id", "result", "error_message",
-			"created_at", "updated_at"})
+			"created_at", "updated_at", "execution_id", "lease_expires_at"})
 	}
 	mock.ExpectQuery("WHERE idempotency_key = \\?").WithArgs("request-1").WillReturnRows(emptyJobRows())
 	mock.ExpectQuery("SELECT max_cpu").WithArgs("tenant-1").
@@ -255,12 +403,21 @@ func jobRows(now time.Time, id, status string) *sqlmock.Rows {
 }
 
 func jobRowsWithWorker(now time.Time, id, status, workerID string) *sqlmock.Rows {
+	return jobRowsWithExecution(now, id, status, workerID, 0, time.Time{})
+}
+
+func jobRowsWithExecution(now time.Time, id, status, workerID string, executionID int64, leaseExpiresAt time.Time) *sqlmock.Rows {
 	var worker any
 	if workerID != "" {
 		worker = workerID
 	}
+	var lease any
+	if !leaseExpiresAt.IsZero() {
+		lease = leaseExpiresAt
+	}
 	return sqlmock.NewRows([]string{"id", "tenant_id", "idempotency_key", "command",
 		"req_cpu", "req_memory_mb", "req_gpu", "status", "worker_id", "result", "error_message",
-		"created_at", "updated_at"}).AddRow(id, "tenant-1", "request-1", "go test ./...",
-		2, int64(2048), 0, status, worker, nil, nil, now, now)
+		"created_at", "updated_at", "execution_id", "lease_expires_at"}).AddRow(
+		id, "tenant-1", "request-1", "go test ./...", 2, int64(2048), 0, status,
+		worker, nil, nil, now, now, executionID, lease)
 }

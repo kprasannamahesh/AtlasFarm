@@ -18,6 +18,7 @@ var (
 	ErrNotFound          = errors.New("resource not found")
 	ErrInvalidTransition = errors.New("invalid job status transition")
 	ErrInvalidRequest    = errors.New("invalid request")
+	ErrStaleExecution    = errors.New("stale execution fencing token")
 )
 
 type Store struct {
@@ -25,20 +26,31 @@ type Store struct {
 }
 
 type Job struct {
-	ID             string    `json:"id"`
-	TenantID       string    `json:"tenant_id"`
-	IdempotencyKey string    `json:"idempotency_key"`
-	Command        string    `json:"command"`
-	CPU            int       `json:"req_cpu"`
-	MemoryMB       int64     `json:"req_memory_mb"`
-	GPU            int       `json:"req_gpu"`
-	Status         string    `json:"status"`
-	WorkerID       string    `json:"worker_id,omitempty"`
-	Result         string    `json:"result,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	Claimed        bool      `json:"claimed,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             string     `json:"id"`
+	TenantID       string     `json:"tenant_id"`
+	IdempotencyKey string     `json:"idempotency_key"`
+	Command        string     `json:"command"`
+	CPU            int        `json:"req_cpu"`
+	MemoryMB       int64      `json:"req_memory_mb"`
+	GPU            int        `json:"req_gpu"`
+	Status         string     `json:"status"`
+	WorkerID       string     `json:"worker_id,omitempty"`
+	Result         string     `json:"result,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	Claimed        bool       `json:"claimed,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+	ExecutionID    int64      `json:"execution_id"`
+	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
+	Events         []JobEvent `json:"events,omitempty"`
+}
+
+type JobEvent struct {
+	SequenceNum int             `json:"sequence_num"`
+	EventType   string          `json:"event_type"`
+	Payload     json.RawMessage `json:"payload"`
+	TraceID     *string         `json:"trace_id,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
 }
 
 type Worker struct {
@@ -62,6 +74,20 @@ type CreateJobRequest struct {
 	CPU            int    `json:"req_cpu"`
 	MemoryMB       int64  `json:"req_memory_mb"`
 	GPU            int    `json:"req_gpu"`
+}
+
+type ActiveLease struct {
+	JobID       string `json:"job_id"`
+	ExecutionID int64  `json:"execution_id"`
+}
+
+type ExpiredJob struct {
+	ID       string
+	WorkerID string
+	CPU      int
+	MemoryMB int64
+	GPU      int
+	Status   string
 }
 
 func New(db *sql.DB) *Store {
@@ -100,7 +126,8 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 
 	existing, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
 	if err == nil {
 		if err := tx.Commit(); err != nil {
 			return Job{}, false, fmt.Errorf("commit duplicate job lookup: %w", err)
@@ -117,7 +144,8 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 	}
 	existing, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
 	if err == nil {
 		if err := tx.Commit(); err != nil {
 			return Job{}, false, fmt.Errorf("commit duplicate job lookup: %w", err)
@@ -141,7 +169,8 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`,
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`,
 		req.IdempotencyKey))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read created job: %w", err)
@@ -158,7 +187,8 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 	} else {
 		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 			req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-			created_at, updated_at FROM jobs_projection WHERE idempotency_key = ?`, req.IdempotencyKey))
+			created_at, updated_at, execution_id, lease_expires_at
+			FROM jobs_projection WHERE idempotency_key = ?`, req.IdempotencyKey))
 		if err != nil {
 			return Job{}, false, fmt.Errorf("read duplicate idempotent job: %w", err)
 		}
@@ -175,10 +205,11 @@ func (s *Store) ListQueuedJobs(ctx context.Context, limit int) ([]Job, error) {
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at
+		created_at, updated_at, execution_id, lease_expires_at
 		FROM (
 			SELECT id, tenant_id, idempotency_key, command, req_cpu, req_memory_mb,
 				req_gpu, status, worker_id, result, error_message, created_at, updated_at,
+				execution_id, lease_expires_at,
 				ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at, id) AS queue_position
 			FROM jobs_projection WHERE status = 'queued'
 		) AS queued_jobs
@@ -231,7 +262,8 @@ func (s *Store) ScheduleJob(ctx context.Context, id, workerID string) (Job, bool
 	defer tx.Rollback()
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, ErrNotFound
 	}
@@ -261,18 +293,22 @@ func (s *Store) ScheduleJob(ctx context.Context, id, workerID string) (Job, bool
 	if changed != 1 {
 		return Job{}, false, fmt.Errorf("worker %q is unavailable or lacks requested resources", workerID)
 	}
+	nextExecutionID := job.ExecutionID + 1
 	if err := appendEvent(ctx, tx, job.ID, "JOB_SCHEDULED", map[string]any{
-		"status": "scheduled", "worker_id": workerID,
+		"status": "scheduled", "worker_id": workerID, "execution_id": nextExecutionID,
 	}); err != nil {
 		return Job{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET status = 'scheduled', worker_id = ? WHERE id = ?`,
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET status = 'scheduled',
+		worker_id = ?, execution_id = execution_id + 1,
+		lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND) WHERE id = ?`,
 		workerID, job.ID); err != nil {
 		return Job{}, false, fmt.Errorf("update scheduled job projection: %w", err)
 	}
 	job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE id = ?`, id))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ?`, id))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read scheduled job: %w", err)
 	}
@@ -285,7 +321,8 @@ func (s *Store) ScheduleJob(ctx context.Context, id, workerID string) (Job, bool
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	job, err := scanJob(s.db.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE id = ?`, id))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, ErrNotFound
 	}
@@ -295,10 +332,60 @@ func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	return job, nil
 }
 
+func (s *Store) GetJobWithEvents(ctx context.Context, id string) (Job, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Job{}, fmt.Errorf("begin job detail read: %w", err)
+	}
+	defer tx.Rollback()
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
+		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Job{}, ErrNotFound
+	}
+	if err != nil {
+		return Job{}, fmt.Errorf("get job detail: %w", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT sequence_num, event_type, payload, trace_id, created_at
+		FROM job_events WHERE job_id = ? ORDER BY sequence_num`, id)
+	if err != nil {
+		return Job{}, fmt.Errorf("list events for job %s: %w", id, err)
+	}
+	job.Events = make([]JobEvent, 0)
+	for rows.Next() {
+		var event JobEvent
+		var payload []byte
+		var traceID sql.NullString
+		if err := rows.Scan(&event.SequenceNum, &event.EventType, &payload, &traceID, &event.CreatedAt); err != nil {
+			rows.Close()
+			return Job{}, fmt.Errorf("scan event for job %s: %w", id, err)
+		}
+		event.Payload = append(json.RawMessage(nil), payload...)
+		if traceID.Valid {
+			event.TraceID = &traceID.String
+		}
+		job.Events = append(job.Events, event)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return Job{}, fmt.Errorf("iterate events for job %s: %w", id, err)
+	}
+	if err := rows.Close(); err != nil {
+		return Job{}, fmt.Errorf("close events for job %s: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return Job{}, fmt.Errorf("commit job detail read: %w", err)
+	}
+	return job, nil
+}
+
 func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection ORDER BY created_at DESC LIMIT 500`)
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection ORDER BY created_at DESC LIMIT 500`)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
@@ -323,6 +410,15 @@ func (s *Store) TransitionJob(ctx context.Context, id, status, workerID, output,
 }
 
 func (s *Store) TransitionJobWithChange(ctx context.Context, id, status, workerID, output, failure string) (Job, bool, error) {
+	return s.TransitionJobWithExecution(ctx, id, status, workerID, 0, output, failure)
+}
+
+func (s *Store) TransitionJobWithExecution(
+	ctx context.Context,
+	id, status, workerID string,
+	executionID int64,
+	output, failure string,
+) (Job, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("begin job transition: %w", err)
@@ -331,12 +427,22 @@ func (s *Store) TransitionJobWithChange(ctx context.Context, id, status, workerI
 
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, ErrNotFound
 	}
 	if err != nil {
 		return Job{}, false, fmt.Errorf("lock job: %w", err)
+	}
+	if terminal(job.Status) {
+		return Job{}, false, ErrStaleExecution
+	}
+	if status != "cancelled" && (executionID <= 0 || executionID != job.ExecutionID) {
+		return Job{}, false, ErrStaleExecution
+	}
+	if status != "cancelled" && (job.Status != "running" || workerID == "" || workerID != job.WorkerID) {
+		return Job{}, false, ErrStaleExecution
 	}
 	if status == job.Status {
 		if err := tx.Commit(); err != nil {
@@ -347,16 +453,16 @@ func (s *Store) TransitionJobWithChange(ctx context.Context, id, status, workerI
 	if !validTransition(job.Status, status) {
 		return Job{}, false, fmt.Errorf("%w: %s to %s", ErrInvalidTransition, job.Status, status)
 	}
-	if status != "cancelled" && (workerID == "" || workerID != job.WorkerID) {
-		return Job{}, false, fmt.Errorf("%w: worker %q does not own job %s", ErrInvalidTransition, workerID, id)
-	}
 	eventType := map[string]string{
 		"running": "JOB_STARTED", "succeeded": "JOB_COMPLETED",
 		"failed": "JOB_FAILED", "cancelled": "JOB_CANCELLED",
 	}[status]
-	payload := map[string]string{"status": status}
+	payload := map[string]any{"status": status}
 	if workerID != "" {
 		payload["worker_id"] = workerID
+	}
+	if status != "cancelled" {
+		payload["execution_id"] = executionID
 	}
 	if output != "" {
 		payload["result"] = output
@@ -384,14 +490,16 @@ func (s *Store) TransitionJobWithChange(ctx context.Context, id, status, workerI
 	_, err = tx.ExecContext(ctx, `UPDATE jobs_projection SET status = ?,
 		worker_id = COALESCE(NULLIF(?, ''), worker_id),
 		result = COALESCE(NULLIF(?, ''), result),
-		error_message = COALESCE(NULLIF(?, ''), error_message) WHERE id = ?`,
+		error_message = COALESCE(NULLIF(?, ''), error_message),
+		lease_expires_at = NULL WHERE id = ?`,
 		status, workerID, output, failure, id)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("update job projection: %w", err)
 	}
 	job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE id = ?`, id))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ?`, id))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read transitioned job: %w", err)
 	}
@@ -401,7 +509,7 @@ func (s *Store) TransitionJobWithChange(ctx context.Context, id, status, workerI
 	return job, true, nil
 }
 
-func (s *Store) ClaimJob(ctx context.Context, id, workerID string) (Job, bool, error) {
+func (s *Store) ClaimJob(ctx context.Context, id, workerID string, executionID int64) (Job, bool, error) {
 	if strings.TrimSpace(workerID) == "" {
 		return Job{}, false, fmt.Errorf("%w: worker_id is required", ErrInvalidRequest)
 	}
@@ -412,37 +520,41 @@ func (s *Store) ClaimJob(ctx context.Context, id, workerID string) (Job, bool, e
 	defer tx.Rollback()
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, ErrNotFound
 	}
 	if err != nil {
 		return Job{}, false, fmt.Errorf("lock job for claim: %w", err)
 	}
-	if job.Status != "scheduled" && job.Status != "queued" {
-		if err := tx.Commit(); err != nil {
-			return Job{}, false, fmt.Errorf("commit duplicate job claim: %w", err)
-		}
-		return job, false, nil
+	if terminal(job.Status) || executionID <= 0 || executionID != job.ExecutionID {
+		return Job{}, false, ErrStaleExecution
 	}
-	if job.Status == "scheduled" && job.WorkerID != workerID {
-		if err := tx.Commit(); err != nil {
-			return Job{}, false, fmt.Errorf("commit rejected job claim: %w", err)
-		}
-		return job, false, nil
+	if job.Status != "scheduled" || job.WorkerID != workerID {
+		return Job{}, false, ErrStaleExecution
 	}
-	if err := appendEvent(ctx, tx, id, "JOB_STARTED", map[string]string{
-		"status": "running", "worker_id": workerID,
+	nextExecutionID := job.ExecutionID + 1
+	if err := appendEvent(ctx, tx, id, "JOB_LEASED", map[string]any{
+		"status": "leased", "worker_id": workerID, "execution_id": nextExecutionID,
 	}); err != nil {
 		return Job{}, false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET status = 'running', worker_id = ? WHERE id = ?`,
-		workerID, id); err != nil {
+	if err := appendEvent(ctx, tx, id, "JOB_STARTED", map[string]any{
+		"status": "running", "worker_id": workerID, "execution_id": nextExecutionID,
+	}); err != nil {
+		return Job{}, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET status = 'running',
+		worker_id = ?, execution_id = execution_id + 1,
+		lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND)
+		WHERE id = ?`, workerID, id); err != nil {
 		return Job{}, false, fmt.Errorf("claim job: %w", err)
 	}
 	job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at FROM jobs_projection WHERE id = ?`, id))
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ?`, id))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read claimed job: %w", err)
 	}
@@ -460,6 +572,10 @@ func validTransition(from, to string) bool {
 	return (from == "queued" && to == "running") ||
 		(from == "scheduled" && to == "running") ||
 		(from == "running" && (to == "succeeded" || to == "failed"))
+}
+
+func terminal(status string) bool {
+	return status == "succeeded" || status == "failed" || status == "cancelled"
 }
 
 func appendEvent(ctx context.Context, tx *sql.Tx, jobID, eventType string, payload any) error {
@@ -488,10 +604,14 @@ type scanner interface {
 func scanJob(row scanner) (Job, error) {
 	var job Job
 	var workerID, result, failure sql.NullString
+	var leaseExpiresAt sql.NullTime
 	err := row.Scan(&job.ID, &job.TenantID, &job.IdempotencyKey, &job.Command,
 		&job.CPU, &job.MemoryMB, &job.GPU, &job.Status, &workerID, &result, &failure,
-		&job.CreatedAt, &job.UpdatedAt)
+		&job.CreatedAt, &job.UpdatedAt, &job.ExecutionID, &leaseExpiresAt)
 	job.WorkerID, job.Result, job.Error = workerID.String, result.String, failure.String
+	if leaseExpiresAt.Valid {
+		job.LeaseExpiresAt = &leaseExpiresAt.Time
+	}
 	return job, err
 }
 
@@ -516,7 +636,16 @@ func (s *Store) RegisterWorker(ctx context.Context, worker Worker) error {
 }
 
 func (s *Store) Heartbeat(ctx context.Context, id string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE workers SET status = 'online',
+	return s.HeartbeatWithLeases(ctx, id, nil)
+}
+
+func (s *Store) HeartbeatWithLeases(ctx context.Context, id string, active []ActiveLease) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin worker heartbeat: %w", err)
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, `UPDATE workers SET status = 'online',
 		last_heartbeat = CURRENT_TIMESTAMP(6) WHERE id = ?`, id)
 	if err != nil {
 		return fmt.Errorf("update worker heartbeat: %w", err)
@@ -527,19 +656,160 @@ func (s *Store) Heartbeat(ctx context.Context, id string) error {
 	}
 	if changed == 0 {
 		var exists int
-		if err := s.db.QueryRowContext(ctx, `SELECT 1 FROM workers WHERE id = ?`, id).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, `SELECT 1 FROM workers WHERE id = ?`, id).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		} else if err != nil {
 			return fmt.Errorf("verify worker heartbeat: %w", err)
 		}
 	}
+	for _, lease := range active {
+		if lease.JobID == "" || lease.ExecutionID <= 0 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET
+			lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND)
+			WHERE id = ? AND worker_id = ? AND execution_id = ?
+			AND status IN ('scheduled', 'leased', 'running')`,
+			lease.JobID, id, lease.ExecutionID); err != nil {
+			return fmt.Errorf("renew lease for job %s: %w", lease.JobID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit worker heartbeat: %w", err)
+	}
 	return nil
+}
+
+func (s *Store) MarkUnhealthyWorkers(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE workers SET status = 'UNHEALTHY'
+		WHERE status IN ('online', 'active', 'healthy')
+		AND last_heartbeat < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 20 SECOND)`)
+	if err != nil {
+		return fmt.Errorf("mark workers with expired heartbeats unhealthy: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) ReapExpiredJobs(ctx context.Context, maxRetries, limit int) ([]ExpiredJob, error) {
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM jobs_projection
+		WHERE status IN ('scheduled', 'leased', 'running')
+		AND lease_expires_at < CURRENT_TIMESTAMP(6)
+		ORDER BY lease_expires_at, id LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("find expired job leases: %w", err)
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan expired job ID: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterate expired job IDs: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close expired job query: %w", err)
+	}
+
+	reaped := make([]ExpiredJob, 0, len(ids))
+	for _, id := range ids {
+		job, didReap, err := s.reapExpiredJob(ctx, id, maxRetries)
+		if err != nil {
+			return reaped, err
+		}
+		if didReap {
+			reaped = append(reaped, job)
+		}
+	}
+	return reaped, nil
+}
+
+func (s *Store) reapExpiredJob(ctx context.Context, id string, maxRetries int) (ExpiredJob, bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return ExpiredJob{}, false, fmt.Errorf("begin expired job recovery: %w", err)
+	}
+	defer tx.Rollback()
+	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
+		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
+		created_at, updated_at, execution_id, lease_expires_at
+		FROM jobs_projection WHERE id = ?
+		AND status IN ('scheduled', 'leased', 'running')
+		AND lease_expires_at < CURRENT_TIMESTAMP(6) FOR UPDATE`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return ExpiredJob{}, false, fmt.Errorf("commit skipped expired job: %w", err)
+		}
+		return ExpiredJob{}, false, nil
+	}
+	if err != nil {
+		return ExpiredJob{}, false, fmt.Errorf("lock expired job: %w", err)
+	}
+
+	nextStatus := "queued"
+	eventType := "JOB_RETRIED"
+	failure := ""
+	if job.ExecutionID >= int64(maxRetries) {
+		nextStatus = "failed"
+		eventType = "JOB_FAILED"
+		failure = "lease expired after maximum retries"
+	}
+	executionIDIncrement := 0
+	if nextStatus == "queued" {
+		executionIDIncrement = 1
+	}
+	payload := map[string]any{
+		"status": nextStatus, "execution_id": job.ExecutionID,
+		"worker_id": job.WorkerID, "reason": "lease expired",
+	}
+	if failure != "" {
+		payload["error"] = failure
+	}
+	if err := appendEvent(ctx, tx, job.ID, eventType, payload); err != nil {
+		return ExpiredJob{}, false, err
+	}
+	if job.WorkerID != "" {
+		if _, err := tx.ExecContext(ctx, `UPDATE workers SET
+			used_cpu = GREATEST(0, used_cpu - ?),
+			used_memory_mb = GREATEST(0, used_memory_mb - ?),
+			used_gpu = GREATEST(0, used_gpu - ?) WHERE id = ?`,
+			job.CPU, job.MemoryMB, job.GPU, job.WorkerID); err != nil {
+			return ExpiredJob{}, false, fmt.Errorf("release expired job worker resources: %w", err)
+		}
+	}
+	workerID := job.WorkerID
+	if nextStatus == "queued" {
+		workerID = ""
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET status = ?, worker_id = ?,
+		execution_id = execution_id + ?, lease_expires_at = NULL,
+		error_message = COALESCE(NULLIF(?, ''), error_message) WHERE id = ?`,
+		nextStatus, workerID, executionIDIncrement, failure, job.ID); err != nil {
+		return ExpiredJob{}, false, fmt.Errorf("reset expired job projection: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return ExpiredJob{}, false, fmt.Errorf("commit expired job recovery: %w", err)
+	}
+	return ExpiredJob{
+		ID: job.ID, WorkerID: job.WorkerID, CPU: job.CPU, MemoryMB: job.MemoryMB,
+		GPU: job.GPU, Status: nextStatus,
+	}, true, nil
 }
 
 func (s *Store) ListWorkers(ctx context.Context) ([]Worker, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, total_cpu, used_cpu, total_memory_mb,
 		used_memory_mb, total_gpu, used_gpu, runner_version, status,
-		COALESCE(last_heartbeat, '1970-01-01 00:00:00')
+		last_heartbeat
 		FROM workers ORDER BY id`)
 	if err != nil {
 		return nil, fmt.Errorf("list workers: %w", err)
@@ -548,10 +818,14 @@ func (s *Store) ListWorkers(ctx context.Context) ([]Worker, error) {
 	workers := make([]Worker, 0)
 	for rows.Next() {
 		var worker Worker
+		var lastHeartbeat sql.NullTime
 		if err := rows.Scan(&worker.ID, &worker.CPU, &worker.UsedCPU, &worker.MemoryMB,
 			&worker.UsedMemoryMB, &worker.GPU, &worker.UsedGPU,
-			&worker.RunnerVersion, &worker.Status, &worker.LastHeartbeat); err != nil {
+			&worker.RunnerVersion, &worker.Status, &lastHeartbeat); err != nil {
 			return nil, fmt.Errorf("scan worker: %w", err)
+		}
+		if lastHeartbeat.Valid {
+			worker.LastHeartbeat = lastHeartbeat.Time
 		}
 		workers = append(workers, worker)
 	}

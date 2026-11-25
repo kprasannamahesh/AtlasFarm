@@ -8,8 +8,14 @@ prefetch, and a fixed-size execution pool. A worker claims a queued job before
 execution; duplicate deliveries of already-claimed jobs are acknowledged
 without running again.
 
-Worker registration and periodic heartbeats are recorded in MySQL. Each command
-has a configurable timeout, and success, nonzero exit, timeout, and output are
-reported as job lifecycle state. A failed control-plane report causes delivery
-requeue rather than a silent acknowledgement. Lease-based recovery of jobs
-orphaned by worker termination is not yet implemented.
+Worker registration and five-second heartbeats are recorded in MySQL.
+Heartbeats renew the 15-second leases for active `(job_id, execution_id)` pairs;
+workers with no heartbeat for 20 seconds are marked unhealthy. The lease reaper
+checks expired jobs every five seconds, releases worker capacity transactionally,
+and either requeues the job or fails it after the retry limit.
+
+Execution IDs are monotonic fencing tokens. Lifecycle callbacks must present the
+current token, so a delayed worker cannot commit after a job is reassigned.
+Rejected stale callbacks return HTTP 409 and increment a Prometheus counter.
+For databases created before fencing-token support, apply
+`deploy/migrations/001_execution_id_fencing.sql` before upgrading the Control Plane.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/broker"
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/dispatch"
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/events"
+	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/lease"
 	"github.com/kprasannamahesh/AtlasFarm/scheduler"
 )
 
@@ -37,7 +39,7 @@ func main() {
 	startupCancel()
 
 	queue := env("RABBITMQ_QUEUE", "jobs")
-	publisher, rabbitConn, err := broker.Connect(env("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"), queue)
+	publisher, rabbitConn, err := broker.Connect(env("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:25672/"), queue)
 	if err != nil {
 		log.Fatalf("connect to RabbitMQ: %v", err)
 	}
@@ -57,9 +59,11 @@ func main() {
 	}
 	cluster := scheduler.NewClusterState()
 	dispatcher := dispatch.New(eventStore, publisher, cluster, packer)
+	reaper := lease.NewReaper(eventStore, cluster, lease.DefaultMaxRetries)
 
 	mux := http.NewServeMux()
-	apiRoutes := api.NewHandler(eventStore, publisher, cluster).Routes()
+	apiHandler := api.NewHandler(eventStore, publisher, cluster)
+	apiRoutes := apiHandler.Routes()
 	mux.Handle("/v1/", apiRoutes)
 	mux.Handle("/api/v1/", http.StripPrefix("/api", apiRoutes))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -84,6 +88,7 @@ func main() {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		_, _ = w.Write([]byte("# HELP atlasfarm_control_plane_up Control plane process status.\n# TYPE atlasfarm_control_plane_up gauge\natlasfarm_control_plane_up 1\n"))
 		_, _ = w.Write([]byte(cluster.Utilization().Prometheus()))
+		_, _ = fmt.Fprintf(w, "# HELP atlasfarm_stale_commits_rejected_total Lifecycle callbacks rejected for stale execution tokens.\n# TYPE atlasfarm_stale_commits_rejected_total counter\natlasfarm_stale_commits_rejected_total %d\n", apiHandler.StaleCommitsRejected())
 	})
 
 	server := &http.Server{
@@ -95,6 +100,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go dispatcher.Run(ctx)
+	go reaper.Run(ctx)
 
 	serverErrors := make(chan error, 1)
 	go func() {

@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS jobs_projection (
     id VARCHAR(36) PRIMARY KEY,
     tenant_id VARCHAR(36) NOT NULL,
     idempotency_key VARCHAR(128) NOT NULL,
-    execution_id VARCHAR(36),
+    execution_id BIGINT NOT NULL DEFAULT 0,
     command TEXT NOT NULL,
     req_cpu INT NOT NULL DEFAULT 1,
     req_memory_mb BIGINT NOT NULL DEFAULT 1024,

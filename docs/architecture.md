@@ -13,5 +13,5 @@ and a transactional queued-to-running claim prevents duplicate broker messages
 from starting the same job twice.
 
 The REST API is described in `api/openapi.yaml`. The control plane defaults to
-`:8080`, MySQL at `127.0.0.1:3306`, RabbitMQ at `127.0.0.1:5672`, and a durable
+`:8080`, MySQL at `127.0.0.1:3306`, RabbitMQ at `127.0.0.1:25672`, and a durable
 `jobs` queue; each endpoint can be configured through environment variables.

@@ -7,7 +7,10 @@ import (
 	"fmt"
 )
 
-var ErrExceeded = errors.New("tenant quota exceeded")
+var (
+	ErrExceeded       = errors.New("tenant quota exceeded")
+	ErrTenantNotFound = errors.New("tenant not found")
+)
 
 type Request struct {
 	CPU      int
@@ -30,17 +33,17 @@ type Usage struct {
 }
 
 func Check(limits Limits, usage Usage, request Request) error {
-	if usage.CPU+request.CPU > limits.CPU {
+	if usage.CPU > limits.CPU || request.CPU > limits.CPU-usage.CPU {
 		return fmt.Errorf("%w: CPU usage %d + request %d exceeds limit %d", ErrExceeded, usage.CPU, request.CPU, limits.CPU)
 	}
-	if usage.MemoryMB+request.MemoryMB > limits.MemoryMB {
+	if usage.MemoryMB > limits.MemoryMB || request.MemoryMB > limits.MemoryMB-usage.MemoryMB {
 		return fmt.Errorf("%w: memory usage %d MiB + request %d MiB exceeds limit %d MiB",
 			ErrExceeded, usage.MemoryMB, request.MemoryMB, limits.MemoryMB)
 	}
-	if usage.GPU+request.GPU > limits.GPU {
+	if usage.GPU > limits.GPU || request.GPU > limits.GPU-usage.GPU {
 		return fmt.Errorf("%w: GPU usage %d + request %d exceeds limit %d", ErrExceeded, usage.GPU, request.GPU, limits.GPU)
 	}
-	if usage.ConcurrentJobs+1 > limits.ConcurrentJobs {
+	if usage.ConcurrentJobs >= limits.ConcurrentJobs {
 		return fmt.Errorf("%w: active jobs %d + request 1 exceeds limit %d",
 			ErrExceeded, usage.ConcurrentJobs, limits.ConcurrentJobs)
 	}
@@ -53,7 +56,7 @@ func CheckTransaction(ctx context.Context, tx *sql.Tx, tenantID string, request 
 		FROM tenants WHERE id = ? FOR UPDATE`, tenantID).Scan(
 		&limits.CPU, &limits.MemoryMB, &limits.GPU, &limits.ConcurrentJobs)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("tenant %q does not exist", tenantID)
+		return fmt.Errorf("%w: %q", ErrTenantNotFound, tenantID)
 	}
 	if err != nil {
 		return fmt.Errorf("load tenant quota: %w", err)

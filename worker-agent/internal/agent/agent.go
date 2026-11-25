@@ -9,12 +9,11 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/kprasannamahesh/AtlasFarm/worker-agent/internal/executor"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
 
@@ -33,22 +32,31 @@ type Config struct {
 }
 
 type Job struct {
-	ID       string `json:"id"`
-	Command  string `json:"command"`
-	Status   string `json:"status"`
-	WorkerID string `json:"worker_id"`
-	Claimed  bool   `json:"claimed"`
+	ID          string `json:"id"`
+	Command     string `json:"command"`
+	Status      string `json:"status"`
+	WorkerID    string `json:"worker_id"`
+	ExecutionID int64  `json:"execution_id"`
+	Claimed     bool   `json:"claimed"`
+}
+
+type ActiveLease struct {
+	JobID       string `json:"job_id"`
+	ExecutionID int64  `json:"execution_id"`
 }
 
 type Agent struct {
 	config Config
 	client *http.Client
+	mu     sync.RWMutex
+	active map[string]int64
 }
 
 func New(config Config) *Agent {
 	return &Agent{
 		config: config,
 		client: &http.Client{Timeout: 10 * time.Second},
+		active: make(map[string]int64),
 	}
 }
 
@@ -158,7 +166,8 @@ func (a *Agent) heartbeatLoop(ctx context.Context, errs chan<- error) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := a.request(ctx, http.MethodPost, "/v1/workers/"+a.config.ID+"/heartbeat", nil, nil); err != nil {
+			body := map[string]any{"active_jobs": a.activeLeases()}
+			if err := a.request(ctx, http.MethodPost, "/v1/workers/"+a.config.ID+"/heartbeat", body, nil); err != nil {
 				select {
 				case errs <- fmt.Errorf("send worker heartbeat: %w", err):
 				default:
@@ -184,9 +193,17 @@ func (a *Agent) execute(parent context.Context, delivery amqp.Delivery) error {
 		return errors.New("job message missing id or command")
 	}
 
-	started := map[string]string{"status": "running", "worker_id": a.config.ID}
+	started := map[string]any{
+		"status": "running", "worker_id": a.config.ID, "execution_id": job.ExecutionID,
+	}
 	var claim Job
 	if err := a.request(parent, http.MethodPost, "/v1/jobs/"+job.ID+"/status", started, &claim); err != nil {
+		if errors.Is(err, ErrStaleExecution) {
+			if ackErr := delivery.Ack(false); ackErr != nil {
+				return fmt.Errorf("acknowledge stale job %s: %w", job.ID, ackErr)
+			}
+			return nil
+		}
 		if nackErr := delivery.Nack(false, true); nackErr != nil {
 			return fmt.Errorf("report job start: %v; requeue message: %w", err, nackErr)
 		}
@@ -198,12 +215,17 @@ func (a *Agent) execute(parent context.Context, delivery amqp.Delivery) error {
 		}
 		return nil
 	}
+	job.ExecutionID = claim.ExecutionID
+	a.setActive(job.ID, job.ExecutionID)
+	defer a.removeActive(job.ID)
 
 	jobCtx, cancel := context.WithTimeout(parent, a.config.JobTimeout)
 	defer cancel()
-	output, executionErr := runCommand(jobCtx, job.Command)
+	output, executionErr := executor.Run(jobCtx, job.Command)
 	status := "succeeded"
-	report := map[string]string{"status": status, "worker_id": a.config.ID, "result": output}
+	report := map[string]any{
+		"status": status, "worker_id": a.config.ID, "execution_id": job.ExecutionID, "result": output,
+	}
 	if executionErr != nil {
 		status = "failed"
 		report["status"] = status
@@ -211,6 +233,12 @@ func (a *Agent) execute(parent context.Context, delivery amqp.Delivery) error {
 		report["error"] = executionErr.Error()
 	}
 	if err := a.request(parent, http.MethodPost, "/v1/jobs/"+job.ID+"/status", report, nil); err != nil {
+		if errors.Is(err, ErrStaleExecution) {
+			if ackErr := delivery.Ack(false); ackErr != nil {
+				return fmt.Errorf("acknowledge stale result for job %s: %w", job.ID, ackErr)
+			}
+			return nil
+		}
 		if nackErr := delivery.Nack(false, true); nackErr != nil {
 			return fmt.Errorf("report job %s: %v; requeue message: %w", status, err, nackErr)
 		}
@@ -252,7 +280,11 @@ func (a *Agent) request(ctx context.Context, method, path string, body any, resu
 		if readErr != nil {
 			return fmt.Errorf("control plane returned %s (read response: %w)", response.Status, readErr)
 		}
-		return fmt.Errorf("control plane returned %s: %s", response.Status, strings.TrimSpace(string(bodyBytes)))
+		message := strings.TrimSpace(string(bodyBytes))
+		if response.StatusCode == http.StatusConflict {
+			return fmt.Errorf("%w: %s", ErrStaleExecution, message)
+		}
+		return fmt.Errorf("control plane returned %s: %s", response.Status, message)
 	}
 	if result != nil {
 		if err := json.NewDecoder(response.Body).Decode(result); err != nil {
@@ -262,42 +294,28 @@ func (a *Agent) request(ctx context.Context, method, path string, body any, resu
 	return nil
 }
 
-type limitedBuffer struct {
-	buffer bytes.Buffer
-	limit  int
+var ErrStaleExecution = errors.New("stale execution rejected by control plane")
+
+func (a *Agent) setActive(jobID string, executionID int64) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.active[jobID] = executionID
 }
 
-func (b *limitedBuffer) Write(p []byte) (int, error) {
-	n := len(p)
-	remaining := b.limit - b.buffer.Len()
-	if remaining > 0 {
-		if remaining > len(p) {
-			remaining = len(p)
-		}
-		_, _ = b.buffer.Write(p[:remaining])
-	}
-	return n, nil
+func (a *Agent) removeActive(jobID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.active, jobID)
 }
 
-func runCommand(ctx context.Context, command string) (string, error) {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.CommandContext(ctx, "cmd", "/C", command)
-	} else {
-		cmd = exec.CommandContext(ctx, "sh", "-c", command)
+func (a *Agent) activeLeases() []ActiveLease {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	leases := make([]ActiveLease, 0, len(a.active))
+	for jobID, executionID := range a.active {
+		leases = append(leases, ActiveLease{JobID: jobID, ExecutionID: executionID})
 	}
-	output := &limitedBuffer{limit: 1 << 20}
-	cmd.Stdout = output
-	cmd.Stderr = output
-	err := cmd.Run()
-	result := output.buffer.String()
-	if ctx.Err() != nil {
-		return result, fmt.Errorf("job timed out or was cancelled: %w", ctx.Err())
-	}
-	if err != nil {
-		return result, fmt.Errorf("command failed: %w", err)
-	}
-	return result, nil
+	return leases
 }
 
 func Hostname() string {

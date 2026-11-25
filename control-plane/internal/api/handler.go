@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/events"
@@ -18,12 +19,14 @@ import (
 type Store interface {
 	CreateJob(context.Context, events.CreateJobRequest) (events.Job, bool, error)
 	GetJob(context.Context, string) (events.Job, error)
+	GetJobWithEvents(context.Context, string) (events.Job, error)
 	ListJobs(context.Context) ([]events.Job, error)
 	TransitionJob(context.Context, string, string, string, string, string) (events.Job, error)
 	TransitionJobWithChange(context.Context, string, string, string, string, string) (events.Job, bool, error)
-	ClaimJob(context.Context, string, string) (events.Job, bool, error)
+	TransitionJobWithExecution(context.Context, string, string, string, int64, string, string) (events.Job, bool, error)
+	ClaimJob(context.Context, string, string, int64) (events.Job, bool, error)
 	RegisterWorker(context.Context, events.Worker) error
-	Heartbeat(context.Context, string) error
+	HeartbeatWithLeases(context.Context, string, []events.ActiveLease) error
 	ListWorkers(context.Context) ([]events.Worker, error)
 }
 
@@ -38,9 +41,10 @@ type ResourceReleaser interface {
 }
 
 type Handler struct {
-	store     Store
-	publisher Publisher
-	resources ResourceReleaser
+	store                Store
+	publisher            Publisher
+	resources            ResourceReleaser
+	staleCommitsRejected atomic.Uint64
 }
 
 func NewHandler(store Store, publisher Publisher, resources ...ResourceReleaser) *Handler {
@@ -100,41 +104,46 @@ func (h *Handler) jobs(w http.ResponseWriter, r *http.Request) {
 }
 
 type statusRequest struct {
-	Status   string `json:"status"`
-	WorkerID string `json:"worker_id"`
-	Result   string `json:"result"`
-	Error    string `json:"error"`
+	Status      string `json:"status"`
+	WorkerID    string `json:"worker_id"`
+	ExecutionID int64  `json:"execution_id"`
+	Result      string `json:"result"`
+	Error       string `json:"error"`
+}
+
+type heartbeatRequest struct {
+	ActiveJobs []events.ActiveLease `json:"active_jobs"`
 }
 
 func (h *Handler) job(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/jobs/"), "/"), "/")
 	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet {
-		job, err := h.store.GetJob(r.Context(), parts[0])
+		job, err := h.store.GetJobWithEvents(r.Context(), parts[0])
 		if err != nil {
 			h.storeError(w, err)
 			return
 		}
-		if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodDelete {
-			current, err := h.store.GetJob(r.Context(), parts[0])
-			if err != nil {
-				h.storeError(w, err)
-				return
-			}
-			job, changed, err := h.store.TransitionJobWithChange(r.Context(), parts[0], "cancelled", "", "", "")
-			if err != nil {
-				h.storeError(w, err)
-				return
-			}
-			h.releaseResources(job, changed)
-			if current.WorkerID != "" && current.Status != "succeeded" && current.Status != "failed" && current.Status != "cancelled" &&
-				h.publisher != nil {
-				if err := h.publisher.PublishToWorker(r.Context(), current.WorkerID, job); err != nil {
-					writeError(w, http.StatusServiceUnavailable, fmt.Errorf("publish cancellation signal: %w", err))
-					return
-				}
-			}
-			writeJSON(w, http.StatusOK, job)
+		writeJSON(w, http.StatusOK, job)
+		return
+	}
+	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodDelete {
+		current, err := h.store.GetJob(r.Context(), parts[0])
+		if err != nil {
+			h.storeError(w, err)
 			return
+		}
+		job, changed, err := h.store.TransitionJobWithChange(r.Context(), parts[0], "cancelled", "", "", "")
+		if err != nil {
+			h.storeError(w, err)
+			return
+		}
+		h.releaseResources(job, changed)
+		if current.WorkerID != "" && current.Status != "succeeded" && current.Status != "failed" && current.Status != "cancelled" &&
+			h.publisher != nil {
+			if err := h.publisher.PublishToWorker(r.Context(), current.WorkerID, job); err != nil {
+				writeError(w, http.StatusServiceUnavailable, fmt.Errorf("publish cancellation signal: %w", err))
+				return
+			}
 		}
 		writeJSON(w, http.StatusOK, job)
 		return
@@ -144,23 +153,30 @@ func (h *Handler) job(w http.ResponseWriter, r *http.Request) {
 		if !decodeJSON(w, r, &req) {
 			return
 		}
+		if req.ExecutionID <= 0 {
+			writeError(w, http.StatusBadRequest, errors.New("execution_id must be greater than zero"))
+			return
+		}
 		var job events.Job
 		var err error
 		if req.Status == "running" {
 			var claimed bool
-			job, claimed, err = h.store.ClaimJob(r.Context(), parts[0], req.WorkerID)
+			job, claimed, err = h.store.ClaimJob(
+				r.Context(), parts[0], req.WorkerID, req.ExecutionID)
 			if err == nil {
 				job.Claimed = claimed
 			}
 		} else {
 			var changed bool
-			job, changed, err = h.store.TransitionJobWithChange(
-				r.Context(), parts[0], req.Status, req.WorkerID, req.Result, req.Error)
+			job, changed, err = h.store.TransitionJobWithExecution(
+				r.Context(), parts[0], req.Status, req.WorkerID,
+				req.ExecutionID, req.Result, req.Error)
 			if err == nil {
 				h.releaseResources(job, changed)
 			}
 		}
 		if err != nil {
+			h.recordStaleCommit(err)
 			h.storeError(w, err)
 			return
 		}
@@ -235,7 +251,15 @@ func (h *Handler) worker(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, errors.New("route not found"))
 		return
 	}
-	if err := h.store.Heartbeat(r.Context(), id); err != nil {
+	var heartbeat heartbeatRequest
+	if !decodeJSON(w, r, &heartbeat) {
+		return
+	}
+	if len(heartbeat.ActiveJobs) > 1024 {
+		writeError(w, http.StatusBadRequest, errors.New("active_jobs cannot exceed 1024 entries"))
+		return
+	}
+	if err := h.store.HeartbeatWithLeases(r.Context(), id, heartbeat.ActiveJobs); err != nil {
 		h.storeError(w, err)
 		return
 	}
@@ -244,6 +268,8 @@ func (h *Handler) worker(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) storeError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, events.ErrStaleExecution):
+		writeError(w, http.StatusConflict, err)
 	case errors.Is(err, events.ErrNotFound):
 		writeError(w, http.StatusNotFound, err)
 	case errors.Is(err, events.ErrInvalidTransition):
@@ -252,9 +278,22 @@ func (h *Handler) storeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusBadRequest, err)
 	case errors.Is(err, quota.ErrExceeded):
 		writeError(w, http.StatusTooManyRequests, err)
+	case errors.Is(err, quota.ErrTenantNotFound):
+		writeError(w, http.StatusBadRequest, err)
 	default:
 		writeError(w, http.StatusInternalServerError, err)
 	}
+}
+
+func (h *Handler) recordStaleCommit(err error) {
+	if errors.Is(err, events.ErrStaleExecution) {
+		count := h.staleCommitsRejected.Add(1)
+		log.Printf("rejected stale execution commit (total=%d): %v", count, err)
+	}
+}
+
+func (h *Handler) StaleCommitsRejected() uint64 {
+	return h.staleCommitsRejected.Load()
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
