@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-control-plane
+  labels:
+    app.kubernetes.io/name: atlasfarm
+    app.kubernetes.io/component: control-plane
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+  selector:
+    app.kubernetes.io/name: atlasfarm
+    app.kubernetes.io/component: control-plane

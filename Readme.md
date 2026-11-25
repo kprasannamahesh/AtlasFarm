@@ -30,9 +30,11 @@
 └───────┬────────────────────┬────────────────────┬────────┘
         │                    │                    │
         ▼                    ▼                    ▼
-  [ RabbitMQ ]        [ Fluent Bit ->        [ Prometheus +
- (Topic Exchanges      Elasticsearch ]        Grafana / Alerts ]
-  & Dead-Letter Q)    (Log Indexing)         (SLI/SLO Telemetry)
+  [ RabbitMQ ]        [ Loki ]              [ Prometheus +
+ (Topic Exchanges      (Log Storage)          Grafana / Alerts ]
+  & Dead-Letter Q)                          (SLI/SLO Telemetry)
+        │
+        └────────────────── [ Jaeger / OTLP Tracing ]
         │
         ▼
 ┌──────────────────────────────────────────────────────────┐
@@ -49,7 +51,7 @@
 * **Control Plane & Worker Agent:** Go 1.22+ (Goroutines, Channels, `context`, `database/sql`, `os/exec`)
 * **Transactional State & Locking:** MySQL 8.0 (`FOR UPDATE SKIP LOCKED`, optimistic versioning)
 * **Message Broker:** RabbitMQ (Hardware-routed topic exchanges + Dead Letter Queues)
-* **Observability & Logging:** Prometheus, Grafana, Fluent Bit, Elasticsearch & Kibana
+* **Observability & Logging:** Prometheus, Grafana, Loki & Jaeger (OTLP)
 * **Frontend Ops Console:** React, TypeScript, Tailwind CSS
 * **Deployment & Testing:** Docker Compose, Kubernetes (Kind/Helm), `k6`, Go `pprof`
 
@@ -63,13 +65,15 @@
 * Node.js 20+ (for the Ops Console)
 
 ### 1. Start Infrastructure Services
-Spin up MySQL, RabbitMQ, Prometheus, Grafana, and Elasticsearch:
+Spin up MySQL, RabbitMQ, Prometheus, Grafana, Loki, and Jaeger:
 ```bash
 make infra-up
 ```
 * **RabbitMQ UI:** `http://localhost:15672` (`guest` / `guest`)
 * **Grafana Dashboards:** `http://localhost:3000` (`admin` / `admin`)
 * **Prometheus:** `http://localhost:9090`
+* **Jaeger UI:** `http://localhost:16686`
+* **Loki API:** `http://localhost:3100`
 
 ### 2. Run the Control Plane
 ```bash
@@ -77,9 +81,9 @@ make run-control
 ```
 
 ### 3. Start Worker Agents
-Launch worker nodes with simulated hardware capability tags:
+Launch a worker with its advertised resource capacity:
 ```bash
-WORKER_TAGS="linux-x86,gpu-a100" RUNNER_VERSION="v1.0.0" make run-worker
+go -C worker-agent run ./cmd/worker --cpu=4 --memory=8192 --gpu=1 --version=v1.0.0
 ```
 
 ### 4. Launch the Ops Console
@@ -118,19 +122,18 @@ Workers execute bounded, isolated CLI tasks inside resource-capped environments:
 
 ```text
 atlasfarm/
-├── control-plane/          # Go REST API, SKIP LOCKED dispatcher, lease reaper & SRE loop
-├── worker-agent/           # Go RabbitMQ consumer, bounded goroutine pool & command runner
-├── web-console/            # React + TypeScript operational dashboard
-├── deploy/
-│   ├── docker-compose.yml  # Local 16GB-tuned infrastructure stack
-│   ├── k8s/                # Kubernetes manifests & Horizontal Pod Autoscaler (HPA)
-│   └── observability/      # Prometheus scrape configs, alert rules & Grafana dashboards
-├── tests/
-│   ├── load/               # k6 load & concurrency test scripts
-│   └── chaos/              # Fault-injection & canary failure simulation scripts
-└── docs/
-    ├── architecture.md     # High-level & low-level design decisions (ADRs)
-    └── benchmarks.md       # pprof profiles & chaos recovery reports
+├── api/                    # OpenAPI contract
+├── control-plane/          # Go control-plane module
+├── scheduler/              # Go resource-aware scheduling module
+├── worker-agent/           # Go worker module
+├── deploy/                 # Local infrastructure and observability configs
+├── helm/atlasfarm/         # Kubernetes Helm chart
+├── k6/                     # Load tests
+├── scripts/chaos/          # Local chaos scripts
+├── dashboards/             # Grafana dashboard placeholders
+├── proto/                  # Worker protocol
+├── web-console/            # React + TypeScript UI placeholder
+└── docs/                   # Architecture, scheduler, and reliability docs
 ```
 
 ---

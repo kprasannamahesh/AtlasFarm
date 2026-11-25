@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package atlasfarm.worker.v1;
+
+option go_package = "github.com/kprasannamahesh/AtlasFarm/proto/worker/v1";
+
+// Placeholder worker protocol. Define service and messages with the API contract.

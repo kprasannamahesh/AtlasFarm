@@ -1,0 +1,6 @@
+openapi: 3.0.3
+info:
+  title: AtlasFarm Control Plane API
+  version: 0.1.0
+  description: Placeholder API contract for AtlasFarm.
+paths: {}
