@@ -79,12 +79,18 @@ make infra-up
 ```bash
 make run-control
 ```
+The control plane uses `DATABASE_DSN` (default
+`root:atlasfarm-local@tcp(127.0.0.1:3306)/atlasfarm?parseTime=true`) and
+`RABBITMQ_URL` (default `amqp://guest:guest@127.0.0.1:5672/`). Its job and
+worker endpoints are documented in `api/openapi.yaml`.
 
 ### 3. Start Worker Agents
 Launch a worker with its advertised resource capacity:
 ```bash
-go -C worker-agent run ./cmd/worker --cpu=4 --memory=8192 --gpu=1 --version=v1.0.0
+go -C worker-agent run ./cmd/worker --cpu=4 --memory=8192 --gpu=1 --version=v1.0.0 --concurrency=2 --job-timeout=15m
 ```
+Use `--control-plane`, `--rabbitmq-url`, `--queue`, `--heartbeat-interval`,
+and `--id` to configure worker registration and execution.
 
 ### 4. Launch the Ops Console
 ```bash

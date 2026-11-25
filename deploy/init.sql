@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS jobs_projection (
     req_gpu INT NOT NULL DEFAULT 0,
     status VARCHAR(32) NOT NULL,
     worker_id VARCHAR(36),
+    result MEDIUMTEXT,
+    error_message MEDIUMTEXT,
     lease_expires_at TIMESTAMP(6) NULL,
     trace_id VARCHAR(64),
     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),

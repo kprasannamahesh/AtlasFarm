@@ -1,6 +1,161 @@
 openapi: 3.0.3
 info:
   title: AtlasFarm Control Plane API
-  version: 0.1.0
-  description: Placeholder API contract for AtlasFarm.
-paths: {}
+  version: 1.0.0
+  description: Job submission and worker lifecycle APIs.
+servers:
+  - url: http://localhost:8080
+paths:
+  /v1/jobs:
+    post:
+      summary: Create an idempotent job and publish it to the worker queue
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: false
+          schema:
+            type: string
+          description: May be supplied instead of the idempotency_key JSON field.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateJob'
+      responses:
+        '201':
+          description: Job created and published
+        '200':
+          description: Existing idempotent job published again
+        '400':
+          description: Invalid request
+        '503':
+          description: Message broker unavailable
+    get:
+      summary: List recent jobs
+      responses:
+        '200':
+          description: Jobs
+  /v1/jobs/{job_id}:
+    get:
+      summary: Get a job
+      parameters:
+        - $ref: '#/components/parameters/JobID'
+      responses:
+        '200':
+          description: Job
+        '404':
+          description: Job not found
+  /v1/jobs/{job_id}/status:
+    post:
+      summary: Claim a queued job or report its terminal outcome
+      parameters:
+        - $ref: '#/components/parameters/JobID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobStatus'
+      responses:
+        '200':
+          description: Updated job; a running response includes claimed=true only for the successful claim
+        '404':
+          description: Job not found
+        '409':
+          description: Invalid transition
+  /v1/workers:
+    post:
+      summary: Register or refresh worker capacity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Worker'
+      responses:
+        '201':
+          description: Worker registered
+    get:
+      summary: List registered workers
+      responses:
+        '200':
+          description: Workers
+  /v1/workers/{worker_id}/heartbeat:
+    post:
+      summary: Record worker liveness
+      parameters:
+        - in: path
+          name: worker_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Heartbeat accepted
+        '404':
+          description: Worker not found
+components:
+  parameters:
+    JobID:
+      in: path
+      name: job_id
+      required: true
+      schema:
+        type: string
+  schemas:
+    CreateJob:
+      type: object
+      required: [tenant_id, command]
+      properties:
+        tenant_id:
+          type: string
+        idempotency_key:
+          type: string
+          maxLength: 128
+          description: Optional when the Idempotency-Key request header is provided.
+        command:
+          type: string
+        cpu:
+          type: integer
+          minimum: 1
+          default: 1
+        memory_mb:
+          type: integer
+          minimum: 1
+          default: 1024
+        gpu:
+          type: integer
+          minimum: 0
+          default: 0
+    JobStatus:
+      type: object
+      required: [status, worker_id]
+      properties:
+        status:
+          type: string
+          enum: [running, succeeded, failed]
+        worker_id:
+          type: string
+        result:
+          type: string
+        error:
+          type: string
+    Worker:
+      type: object
+      required: [id, cpu, memory_mb, runner_version]
+      properties:
+        id:
+          type: string
+        cpu:
+          type: integer
+          minimum: 1
+        memory_mb:
+          type: integer
+          minimum: 1
+        gpu:
+          type: integer
+          minimum: 0
+          default: 0
+        runner_version:
+          type: string
