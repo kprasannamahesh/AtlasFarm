@@ -734,11 +734,13 @@ func (s *Store) HeartbeatWithLeases(ctx context.Context, id string, active []Act
 }
 
 func (s *Store) MarkUnhealthyWorkers(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE workers SET status = 'UNHEALTHY'
-		WHERE status IN ('online', 'active', 'healthy')
-		AND last_heartbeat < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 20 SECOND)`)
+	_, err := s.db.ExecContext(ctx, `UPDATE workers SET status = 'OFFLINE',
+		used_cpu = 0, used_memory_mb = 0, used_gpu = 0
+		WHERE status <> 'OFFLINE'
+		AND (last_heartbeat IS NULL OR
+			last_heartbeat < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND))`)
 	if err != nil {
-		return fmt.Errorf("mark workers with expired heartbeats unhealthy: %w", err)
+		return fmt.Errorf("mark workers with expired heartbeats offline: %w", err)
 	}
 	return nil
 }
@@ -860,10 +862,24 @@ func (s *Store) reapExpiredJob(ctx context.Context, id string, maxRetries int) (
 }
 
 func (s *Store) ListWorkers(ctx context.Context) ([]Worker, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, total_cpu, used_cpu, total_memory_mb,
+	return s.listWorkers(ctx, false)
+}
+
+func (s *Store) ListActiveWorkers(ctx context.Context) ([]Worker, error) {
+	return s.listWorkers(ctx, true)
+}
+
+func (s *Store) listWorkers(ctx context.Context, activeOnly bool) ([]Worker, error) {
+	query := `SELECT id, total_cpu, used_cpu, total_memory_mb,
 		used_memory_mb, total_gpu, used_gpu, runner_version, status,
 		last_heartbeat
-		FROM workers ORDER BY id`)
+		FROM workers`
+	if activeOnly {
+		query += ` WHERE status = 'HEALTHY'
+			OR last_heartbeat >= DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 30 SECOND)`
+	}
+	query += ` ORDER BY id`
+	rows, err := s.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("list workers: %w", err)
 	}
@@ -886,4 +902,18 @@ func (s *Store) ListWorkers(ctx context.Context) ([]Worker, error) {
 		return nil, fmt.Errorf("iterate workers: %w", err)
 	}
 	return workers, nil
+}
+
+func (s *Store) PurgeStaleWorkers(ctx context.Context) (int64, error) {
+	result, err := s.db.ExecContext(ctx, `DELETE FROM workers
+		WHERE status = 'OFFLINE' OR last_heartbeat IS NULL
+		OR last_heartbeat < DATE_SUB(CURRENT_TIMESTAMP(6), INTERVAL 30 SECOND)`)
+	if err != nil {
+		return 0, fmt.Errorf("purge stale workers: %w", err)
+	}
+	purged, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("read purged worker count: %w", err)
+	}
+	return purged, nil
 }

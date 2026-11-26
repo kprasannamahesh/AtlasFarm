@@ -89,9 +89,30 @@ paths:
           description: Worker registered
     get:
       summary: List registered workers
+      parameters:
+        - in: query
+          name: active_only
+          schema:
+            type: boolean
+          description: Limit results to healthy workers or workers with a heartbeat in the last 30 seconds.
       responses:
         '200':
           description: Workers
+  /v1/workers/stale:
+    delete:
+      summary: Purge offline or stale workers
+      responses:
+        '200':
+          description: Number of worker records purged
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [purged]
+                properties:
+                  purged:
+                    type: integer
+                    format: int64
   /v1/workers/{worker_id}/heartbeat:
     post:
       summary: Record worker liveness and renew active execution leases

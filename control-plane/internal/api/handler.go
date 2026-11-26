@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -32,6 +33,8 @@ type Store interface {
 	RegisterWorker(context.Context, events.Worker) error
 	HeartbeatWithLeases(context.Context, string, []events.ActiveLease) error
 	ListWorkers(context.Context) ([]events.Worker, error)
+	ListActiveWorkers(context.Context) ([]events.Worker, error)
+	PurgeStaleWorkers(context.Context) (int64, error)
 }
 
 type Publisher interface {
@@ -77,6 +80,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("/v1/jobs", h.jobs)
 	mux.HandleFunc("/v1/jobs/", h.job)
 	mux.HandleFunc("/v1/workers", h.workers)
+	mux.HandleFunc("/v1/workers/stale", h.staleWorkers)
 	mux.HandleFunc("/v1/workers/", h.worker)
 	mux.HandleFunc("/v1/rollouts/current", h.currentRollout)
 	mux.HandleFunc("/v1/rollouts/rollback", h.rollback)
@@ -264,7 +268,22 @@ func (h *Handler) workers(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusCreated, worker)
 	case http.MethodGet:
-		workers, err := h.store.ListWorkers(r.Context())
+		activeOnly := false
+		if value := r.URL.Query().Get("active_only"); value != "" {
+			parsed, err := strconv.ParseBool(value)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, errors.New("active_only must be a boolean"))
+				return
+			}
+			activeOnly = parsed
+		}
+		var workers []events.Worker
+		var err error
+		if activeOnly {
+			workers, err = h.store.ListActiveWorkers(r.Context())
+		} else {
+			workers, err = h.store.ListWorkers(r.Context())
+		}
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
@@ -274,6 +293,20 @@ func (h *Handler) workers(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET, POST")
 		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
 	}
+}
+
+func (h *Handler) staleWorkers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		w.Header().Set("Allow", "DELETE")
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	purged, err := h.store.PurgeStaleWorkers(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"purged": purged})
 }
 
 func (h *Handler) worker(w http.ResponseWriter, r *http.Request) {

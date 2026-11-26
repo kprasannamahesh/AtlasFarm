@@ -22,6 +22,7 @@ type Worker = {
   gpu: number;
   used_gpu: number;
   runner_version: string;
+  last_heartbeat: string;
 };
 
 type JobEvent = {
@@ -90,6 +91,9 @@ function statusColor(status: string) {
 function App() {
   const [tab, setTab] = useState<Tab>("cluster");
   const [workers, setWorkers] = useState<Worker[]>([]);
+  const [showOfflineWorkers, setShowOfflineWorkers] = useState(false);
+  const [purgingWorkers, setPurgingWorkers] = useState(false);
+  const [notice, setNotice] = useState("");
   const [jobs, setJobs] = useState<Job[]>([]);
   const [rollout, setRollout] = useState<Rollout | null>(null);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
@@ -137,9 +141,11 @@ function App() {
   }, [refresh]);
 
   const onlineWorkers = useMemo(
-    () => workers.filter((worker) => ["online", "active", "healthy"].includes(worker.status.toLowerCase())).length,
+    () => workers.filter(isActiveWorker),
     [workers],
   );
+  const offlineWorkerCount = workers.length - onlineWorkers.length;
+  const visibleWorkers = showOfflineWorkers ? workers : onlineWorkers;
 
   async function submitJob(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -208,6 +214,21 @@ function App() {
     }
   }
 
+  async function purgeOfflineWorkers() {
+    setPurgingWorkers(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = await request<{ purged: number }>("/api/v1/workers/stale", { method: "DELETE" });
+      setNotice(`Purged ${result.purged} offline worker${result.purged === 1 ? "" : "s"}.`);
+      await refresh();
+    } catch (purgeError) {
+      setError(purgeError instanceof Error ? purgeError.message : "Unable to purge offline workers");
+    } finally {
+      setPurgingWorkers(false);
+    }
+  }
+
   return (
     <div className="min-h-screen bg-canvas">
       <header className="border-b border-slate-200 bg-white">
@@ -239,7 +260,7 @@ function App() {
             <p className="mt-2 text-muted">Monitor capacity, inspect executions, and manage safe releases.</p>
           </div>
           <div className="grid grid-cols-3 gap-3">
-            <Summary label="Workers online" value={`${onlineWorkers}/${workers.length}`} />
+            <Summary label="Active workers" value={onlineWorkers.length} />
             <Summary label="Recent jobs" value={jobs.length} />
             <Summary label="Canary traffic" value={`${rollout?.canary_percentage ?? 0}%`} />
           </div>
@@ -249,6 +270,11 @@ function App() {
           <div role="alert" className="mb-5 flex items-center justify-between rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-800">
             <span>{error}</span>
             <button className="font-semibold" onClick={() => setError("")}>Dismiss</button>
+          </div>
+        )}
+        {notice && (
+          <div role="status" className="mb-5 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+            {notice}
           </div>
         )}
         {rollout?.status === "ROLLED_BACK" && (
@@ -267,7 +293,17 @@ function App() {
           <TabButton active={tab === "rollout"} onClick={() => setTab("rollout")}>Canary Rollout</TabButton>
         </nav>
 
-        {tab === "cluster" && <ClusterPanel workers={workers} />}
+        {tab === "cluster" && (
+          <ClusterPanel
+            workers={visibleWorkers}
+            activeWorkers={onlineWorkers}
+            offlineCount={offlineWorkerCount}
+            showOfflineWorkers={showOfflineWorkers}
+            onShowOfflineWorkersChange={setShowOfflineWorkers}
+            onPurgeOffline={purgeOfflineWorkers}
+            purging={purgingWorkers}
+          />
+        )}
         {tab === "jobs" && (
           <JobsPanel
             jobs={jobs}
@@ -329,21 +365,67 @@ function TabButton({ active, onClick, children }: { active: boolean; onClick: ()
   );
 }
 
-function ClusterPanel({ workers }: { workers: Worker[] }) {
+function isActiveWorker(worker: Worker) {
+  if (worker.status.toLowerCase() === "healthy") return true;
+  const heartbeat = Date.parse(worker.last_heartbeat);
+  return Number.isFinite(heartbeat) && Date.now() - heartbeat <= 30_000;
+}
+
+function ClusterPanel(props: {
+  workers: Worker[];
+  activeWorkers: Worker[];
+  offlineCount: number;
+  showOfflineWorkers: boolean;
+  onShowOfflineWorkersChange: (show: boolean) => void;
+  onPurgeOffline: () => void;
+  purging: boolean;
+}) {
+  const capacity = props.activeWorkers.reduce(
+    (total, worker) => ({
+      cpu: total.cpu + worker.cpu,
+      memory: total.memory + worker.memory_mb,
+      gpu: total.gpu + worker.gpu,
+    }),
+    { cpu: 0, memory: 0, gpu: 0 },
+  );
   return (
     <section>
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
         <div>
           <h2 className="text-xl font-bold text-ink">Registered workers</h2>
-          <p className="mt-1 text-sm text-muted">Live capacity and runner versions.</p>
+          <p className="mt-1 text-sm text-muted">Active capacity and runner versions.</p>
         </div>
-        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">Refreshes every 5s</span>
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex cursor-pointer items-center gap-2 text-sm font-medium text-muted">
+            <input
+              type="checkbox"
+              checked={props.showOfflineWorkers}
+              onChange={(event) => props.onShowOfflineWorkersChange(event.target.checked)}
+              className="h-4 w-4 accent-blue-600"
+            />
+            Show Offline Workers ({props.offlineCount})
+          </label>
+          <button
+            type="button"
+            disabled={props.purging || props.offlineCount === 0}
+            onClick={props.onPurgeOffline}
+            className="rounded-lg border border-rose-200 px-3 py-2 text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {props.purging ? "Purging..." : "Purge Offline"}
+          </button>
+          <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-600">Refreshes every 5s</span>
+        </div>
       </div>
-      {workers.length === 0 ? (
+      <div className="mb-5 grid gap-3 sm:grid-cols-3">
+        <Summary label="Active CPU capacity" value={`${capacity.cpu} cores`} />
+        <Summary label="Active RAM capacity" value={`${capacity.memory.toLocaleString()} MiB`} />
+        <Summary label="Active GPU capacity" value={capacity.gpu} />
+      </div>
+      {props.workers.length === 0 ? (
         <EmptyState title="No workers registered" detail="Start a worker-agent to see its advertised capacity here." />
       ) : (
         <div className="grid gap-4 lg:grid-cols-2">
-          {workers.map((worker) => (
+          {props.workers.map((worker) => (
             <article key={worker.id} className="rounded-2xl border border-slate-200 bg-white p-5 shadow-card">
               <div className="mb-5 flex items-start justify-between">
                 <div>

@@ -76,6 +76,23 @@ func TestCreateJobIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMarkUnhealthyWorkersMarksStaleWorkersOfflineAndClearsUsage(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := New(db)
+	mock.ExpectExec("(?s)UPDATE workers SET status = 'OFFLINE',.*used_cpu = 0, used_memory_mb = 0, used_gpu = 0.*INTERVAL 15 SECOND").
+		WillReturnResult(sqlmock.NewResult(0, 2))
+	if err := store.MarkUnhealthyWorkers(context.Background()); err != nil {
+		t.Fatalf("MarkUnhealthyWorkers() error = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestGetJobWithEventsReturnsChronologicalAuditTrail(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
