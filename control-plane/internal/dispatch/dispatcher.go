@@ -7,7 +7,12 @@ import (
 	"time"
 
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/events"
+	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/rollout"
 	"github.com/kprasannamahesh/AtlasFarm/scheduler"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Store interface {
@@ -15,6 +20,10 @@ type Store interface {
 	ListWorkers(context.Context) ([]events.Worker, error)
 	TenantWeights(context.Context) (map[string]int, error)
 	ScheduleJob(context.Context, string, string) (events.Job, bool, error)
+}
+
+type RolloutReader interface {
+	GetCurrent(context.Context) (rollout.Rollout, error)
 }
 
 type Publisher interface {
@@ -27,13 +36,18 @@ type Dispatcher struct {
 	cluster *scheduler.ClusterState
 	packer  scheduler.BinPacker
 	fair    *scheduler.FairScheduler
+	rollout RolloutReader
 }
 
-func New(store Store, publish Publisher, cluster *scheduler.ClusterState, packer scheduler.BinPacker) *Dispatcher {
-	return &Dispatcher{
+func New(store Store, publish Publisher, cluster *scheduler.ClusterState, packer scheduler.BinPacker, rolloutReaders ...RolloutReader) *Dispatcher {
+	dispatcher := &Dispatcher{
 		store: store, publish: publish, cluster: cluster, packer: packer,
 		fair: scheduler.NewFairScheduler(),
 	}
+	if len(rolloutReaders) > 0 {
+		dispatcher.rollout = rolloutReaders[0]
+	}
+	return dispatcher
 }
 
 func (d *Dispatcher) Run(ctx context.Context) {
@@ -63,6 +77,7 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 			ID: worker.ID, TotalCPU: worker.CPU, UsedCPU: worker.UsedCPU,
 			TotalMemoryMB: worker.MemoryMB, UsedMemoryMB: worker.UsedMemoryMB,
 			TotalGPU: worker.GPU, UsedGPU: worker.UsedGPU, Status: worker.Status,
+			RunnerVersion: worker.RunnerVersion,
 		})
 	}
 	for _, worker := range d.cluster.Snapshot() {
@@ -82,9 +97,21 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 	}
 	for _, job := range jobs {
 		d.fair.Enqueue(scheduler.Job{
-			ID: job.ID, TenantID: job.TenantID,
+			ID: job.ID, TenantID: job.TenantID, TraceParent: job.TraceParent,
 			Request: scheduler.ResourceRequest{CPU: job.CPU, MemoryMB: job.MemoryMB, GPU: job.GPU},
 		})
+	}
+	rolloutConfig := scheduler.RolloutConfig{}
+	if d.rollout != nil {
+		current, err := d.rollout.GetCurrent(ctx)
+		if err != nil && !errors.Is(err, rollout.ErrNotFound) {
+			return err
+		}
+		if err == nil {
+			rolloutConfig = scheduler.RolloutConfig{
+				TargetVersion: current.TargetVersion, CanaryPercentage: current.CanaryPercentage, Status: current.Status,
+			}
+		}
 	}
 
 	queued := d.fair.Len()
@@ -94,7 +121,8 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 			break
 		}
 		request := scheduledJob.Request
-		worker, err := d.packer.SelectWorker(request, d.cluster.Snapshot())
+		workers := scheduler.WorkersForRollout(scheduledJob.ID, d.cluster.Snapshot(), rolloutConfig)
+		worker, err := d.packer.SelectWorker(request, workers)
 		if err != nil {
 			if errors.Is(err, scheduler.ErrNoEligibleWorker) {
 				d.fair.Enqueue(scheduledJob)
@@ -106,19 +134,32 @@ func (d *Dispatcher) DispatchOnce(ctx context.Context) error {
 			d.fair.Enqueue(scheduledJob)
 			continue
 		}
-		job, claimed, err := d.store.ScheduleJob(ctx, scheduledJob.ID, worker.ID)
+		dispatchCtx := ctx
+		if scheduledJob.TraceParent != "" {
+			dispatchCtx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier{
+				"traceparent": scheduledJob.TraceParent,
+			})
+		}
+		dispatchCtx, span := otel.Tracer("atlasfarm/scheduler").Start(dispatchCtx, "scheduler.dispatch",
+			trace.WithAttributes(attribute.String("job.id", scheduledJob.ID), attribute.String("worker.id", worker.ID)))
+		job, claimed, err := d.store.ScheduleJob(dispatchCtx, scheduledJob.ID, worker.ID)
 		if err != nil {
+			span.RecordError(err)
+			span.End()
 			d.cluster.ReleaseJob(scheduledJob.ID)
 			d.fair.Enqueue(scheduledJob)
 			return err
 		}
 		if !claimed {
+			span.End()
 			d.cluster.ReleaseJob(scheduledJob.ID)
 			continue
 		}
-		if err := d.publish.PublishToWorker(ctx, worker.ID, job); err != nil {
+		if err := d.publish.PublishToWorker(dispatchCtx, worker.ID, job); err != nil {
 			log.Printf("publish scheduled job %s to worker %s: %v", job.ID, worker.ID, err)
+			span.RecordError(err)
 		}
+		span.End()
 	}
 	return nil
 }

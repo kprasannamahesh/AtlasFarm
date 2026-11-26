@@ -14,6 +14,10 @@ import (
 
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/events"
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/quota"
+	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/rollout"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 type Store interface {
@@ -44,7 +48,14 @@ type Handler struct {
 	store                Store
 	publisher            Publisher
 	resources            ResourceReleaser
+	rollouts             RolloutStore
 	staleCommitsRejected atomic.Uint64
+}
+
+type RolloutStore interface {
+	GetCurrent(context.Context) (rollout.Rollout, error)
+	Create(context.Context, rollout.CreateRequest) (rollout.Rollout, error)
+	Rollback(context.Context) (rollout.Rollout, error)
 }
 
 func NewHandler(store Store, publisher Publisher, resources ...ResourceReleaser) *Handler {
@@ -55,22 +66,39 @@ func NewHandler(store Store, publisher Publisher, resources ...ResourceReleaser)
 	return handler
 }
 
+func NewHandlerWithRollouts(store Store, publisher Publisher, rolloutStore RolloutStore, resources ...ResourceReleaser) *Handler {
+	handler := NewHandler(store, publisher, resources...)
+	handler.rollouts = rolloutStore
+	return handler
+}
+
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/jobs", h.jobs)
 	mux.HandleFunc("/v1/jobs/", h.job)
 	mux.HandleFunc("/v1/workers", h.workers)
 	mux.HandleFunc("/v1/workers/", h.worker)
+	mux.HandleFunc("/v1/rollouts/current", h.currentRollout)
+	mux.HandleFunc("/v1/rollouts/rollback", h.rollback)
+	mux.HandleFunc("/v1/rollouts", h.rolloutsEndpoint)
 	return mux
 }
 
 func (h *Handler) jobs(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
+		ctx, span := otel.Tracer("atlasfarm/control-plane").Start(r.Context(), "POST /jobs")
+		defer span.End()
+		traceID := ""
+		if span.SpanContext().IsValid() {
+			traceID = span.SpanContext().TraceID().String()
+		}
+		r = r.WithContext(ctx)
 		var req events.CreateJobRequest
 		if !decodeJSON(w, r, &req) {
 			return
 		}
+		req.TraceID = traceID
 		if req.IdempotencyKey == "" {
 			req.IdempotencyKey = r.Header.Get("Idempotency-Key")
 		}
@@ -82,9 +110,12 @@ func (h *Handler) jobs(w http.ResponseWriter, r *http.Request) {
 		}
 		job, created, err := h.store.CreateJob(r.Context(), req)
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "job creation failed")
 			h.storeError(w, err)
 			return
 		}
+		span.SetAttributes(attribute.String("job.id", job.ID), attribute.String("tenant.id", job.TenantID))
 		status := http.StatusCreated
 		if !created {
 			status = http.StatusOK
@@ -118,8 +149,14 @@ type heartbeatRequest struct {
 func (h *Handler) job(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/jobs/"), "/"), "/")
 	if len(parts) == 1 && parts[0] != "" && r.Method == http.MethodGet {
+		ctx, span := otel.Tracer("atlasfarm/control-plane").Start(r.Context(), "jobs.get")
+		defer span.End()
+		span.SetAttributes(attribute.String("job.id", parts[0]))
+		r = r.WithContext(ctx)
 		job, err := h.store.GetJobWithEvents(r.Context(), parts[0])
 		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "job lookup failed")
 			h.storeError(w, err)
 			return
 		}
@@ -264,6 +301,82 @@ func (h *Handler) worker(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "online"})
+}
+
+func (h *Handler) currentRollout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if h.rollouts == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("rollout service unavailable"))
+		return
+	}
+	current, err := h.rollouts.GetCurrent(r.Context())
+	if err != nil {
+		h.rolloutError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, current)
+}
+
+func (h *Handler) rolloutsEndpoint(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if h.rollouts == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("rollout service unavailable"))
+		return
+	}
+	var req struct {
+		TargetVersion     string  `json:"target_version"`
+		CanaryPercentage  int     `json:"canary_percentage"`
+		ErrorThresholdPct float64 `json:"error_threshold_pct"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	created, err := h.rollouts.Create(r.Context(), rollout.CreateRequest{
+		TargetVersion: req.TargetVersion, CanaryPercentage: req.CanaryPercentage,
+		ErrorThresholdPct: req.ErrorThresholdPct,
+	})
+	if err != nil {
+		h.rolloutError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (h *Handler) rollback(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeError(w, http.StatusMethodNotAllowed, errors.New("method not allowed"))
+		return
+	}
+	if h.rollouts == nil {
+		writeError(w, http.StatusServiceUnavailable, errors.New("rollout service unavailable"))
+		return
+	}
+	rolledBack, err := h.rollouts.Rollback(r.Context())
+	if err != nil {
+		h.rolloutError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rolledBack)
+}
+
+func (h *Handler) rolloutError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, rollout.ErrNotFound):
+		writeError(w, http.StatusNotFound, err)
+	case errors.Is(err, rollout.ErrInvalidRequest):
+		writeError(w, http.StatusBadRequest, err)
+	default:
+		writeError(w, http.StatusInternalServerError, err)
+	}
 }
 
 func (h *Handler) storeError(w http.ResponseWriter, err error) {

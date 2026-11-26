@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/quota"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -42,6 +44,8 @@ type Job struct {
 	UpdatedAt      time.Time  `json:"updated_at"`
 	ExecutionID    int64      `json:"execution_id"`
 	LeaseExpiresAt *time.Time `json:"lease_expires_at,omitempty"`
+	TraceID        string     `json:"trace_id,omitempty"`
+	TraceParent    string     `json:"-"`
 	Events         []JobEvent `json:"events,omitempty"`
 }
 
@@ -74,6 +78,7 @@ type CreateJobRequest struct {
 	CPU            int    `json:"req_cpu"`
 	MemoryMB       int64  `json:"req_memory_mb"`
 	GPU            int    `json:"req_gpu"`
+	TraceID        string `json:"-"`
 }
 
 type ActiveLease struct {
@@ -92,6 +97,32 @@ type ExpiredJob struct {
 
 func New(db *sql.DB) *Store {
 	return &Store{db: db}
+}
+
+func (s *Store) Migrate(ctx context.Context) error {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'jobs_projection'
+		AND COLUMN_NAME = 'traceparent'`).Scan(&count); err != nil {
+		return fmt.Errorf("check jobs_projection traceparent column: %w", err)
+	}
+	if count == 0 {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE jobs_projection
+			ADD COLUMN traceparent VARCHAR(128) NULL AFTER trace_id`); err != nil {
+			return fmt.Errorf("add jobs_projection traceparent column: %w", err)
+		}
+	}
+	return nil
+}
+
+func currentTrace(ctx context.Context) (string, string) {
+	spanContext := trace.SpanContextFromContext(ctx)
+	if !spanContext.IsValid() {
+		return "", ""
+	}
+	carrier := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(ctx, carrier)
+	return spanContext.TraceID().String(), carrier.Get("traceparent")
 }
 
 func newID() (string, error) {
@@ -126,7 +157,7 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 
 	existing, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
 	if err == nil {
 		if err := tx.Commit(); err != nil {
@@ -142,9 +173,13 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 	}); err != nil {
 		return Job{}, false, err
 	}
+	traceID, traceparent := currentTrace(ctx)
+	if req.TraceID != "" {
+		traceID = req.TraceID
+	}
 	existing, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
 	if err == nil {
 		if err := tx.Commit(); err != nil {
@@ -156,9 +191,9 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 		return Job{}, false, fmt.Errorf("recheck existing idempotency key: %w", err)
 	}
 	result, err := tx.ExecContext(ctx, `INSERT IGNORE INTO jobs_projection
-		(id, tenant_id, idempotency_key, command, req_cpu, req_memory_mb, req_gpu, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued')`,
-		req.ID, req.TenantID, req.IdempotencyKey, req.Command, req.CPU, req.MemoryMB, req.GPU)
+		(id, tenant_id, idempotency_key, command, req_cpu, req_memory_mb, req_gpu, status, trace_id, traceparent)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', NULLIF(?, ''), NULLIF(?, ''))`,
+		req.ID, req.TenantID, req.IdempotencyKey, req.Command, req.CPU, req.MemoryMB, req.GPU, traceID, traceparent)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("insert job projection: %w", err)
 	}
@@ -169,25 +204,26 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`,
 		req.IdempotencyKey))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read created job: %w", err)
 	}
+	job.TraceID, job.TraceParent = traceID, traceparent
 	if rows == 1 {
 		if job.ID != req.ID {
 			return Job{}, false, errors.New("job ID already exists")
 		}
-		if err := appendEvent(ctx, tx, job.ID, "JOB_CREATED", map[string]any{
+		if err := appendEventWithTraceID(ctx, tx, job.ID, "JOB_CREATED", map[string]any{
 			"status": job.Status, "tenant_id": job.TenantID,
-		}); err != nil {
+		}, traceID); err != nil {
 			return Job{}, false, err
 		}
 	} else {
 		job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 			req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-			created_at, updated_at, execution_id, lease_expires_at
+			created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 			FROM jobs_projection WHERE idempotency_key = ?`, req.IdempotencyKey))
 		if err != nil {
 			return Job{}, false, fmt.Errorf("read duplicate idempotent job: %w", err)
@@ -205,11 +241,11 @@ func (s *Store) ListQueuedJobs(ctx context.Context, limit int) ([]Job, error) {
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM (
 			SELECT id, tenant_id, idempotency_key, command, req_cpu, req_memory_mb,
 				req_gpu, status, worker_id, result, error_message, created_at, updated_at,
-				execution_id, lease_expires_at,
+				execution_id, lease_expires_at, trace_id, traceparent,
 				ROW_NUMBER() OVER (PARTITION BY tenant_id ORDER BY created_at, id) AS queue_position
 			FROM jobs_projection WHERE status = 'queued'
 		) AS queued_jobs
@@ -262,7 +298,7 @@ func (s *Store) ScheduleJob(ctx context.Context, id, workerID string) (Job, bool
 	defer tx.Rollback()
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, ErrNotFound
@@ -299,15 +335,18 @@ func (s *Store) ScheduleJob(ctx context.Context, id, workerID string) (Job, bool
 	}); err != nil {
 		return Job{}, false, err
 	}
+	traceID, traceparent := currentTrace(ctx)
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET status = 'scheduled',
 		worker_id = ?, execution_id = execution_id + 1,
-		lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND) WHERE id = ?`,
-		workerID, job.ID); err != nil {
+		lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND),
+		trace_id = COALESCE(NULLIF(?, ''), trace_id),
+		traceparent = COALESCE(NULLIF(?, ''), traceparent) WHERE id = ?`,
+		workerID, traceID, traceparent, job.ID); err != nil {
 		return Job{}, false, fmt.Errorf("update scheduled job projection: %w", err)
 	}
 	job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ?`, id))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read scheduled job: %w", err)
@@ -321,7 +360,7 @@ func (s *Store) ScheduleJob(ctx context.Context, id, workerID string) (Job, bool
 func (s *Store) GetJob(ctx context.Context, id string) (Job, error) {
 	job, err := scanJob(s.db.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, ErrNotFound
@@ -340,7 +379,7 @@ func (s *Store) GetJobWithEvents(ctx context.Context, id string) (Job, error) {
 	defer tx.Rollback()
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, ErrNotFound
@@ -384,7 +423,7 @@ func (s *Store) GetJobWithEvents(ctx context.Context, id string) (Job, error) {
 func (s *Store) ListJobs(ctx context.Context) ([]Job, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection ORDER BY created_at DESC LIMIT 500`)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
@@ -427,7 +466,7 @@ func (s *Store) TransitionJobWithExecution(
 
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, ErrNotFound
@@ -477,6 +516,7 @@ func (s *Store) TransitionJobWithExecution(
 	if err := appendEvent(ctx, tx, id, eventType, payload); err != nil {
 		return Job{}, false, err
 	}
+	traceID, traceparent := currentTrace(ctx)
 	if (status == "succeeded" || status == "failed" || status == "cancelled") &&
 		job.WorkerID != "" && (job.Status == "scheduled" || job.Status == "leased" || job.Status == "running") {
 		if _, err := tx.ExecContext(ctx, `UPDATE workers SET
@@ -491,14 +531,16 @@ func (s *Store) TransitionJobWithExecution(
 		worker_id = COALESCE(NULLIF(?, ''), worker_id),
 		result = COALESCE(NULLIF(?, ''), result),
 		error_message = COALESCE(NULLIF(?, ''), error_message),
-		lease_expires_at = NULL WHERE id = ?`,
-		status, workerID, output, failure, id)
+		lease_expires_at = NULL,
+		trace_id = COALESCE(NULLIF(?, ''), trace_id),
+		traceparent = COALESCE(NULLIF(?, ''), traceparent) WHERE id = ?`,
+		status, workerID, output, failure, traceID, traceparent, id)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("update job projection: %w", err)
 	}
 	job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ?`, id))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read transitioned job: %w", err)
@@ -520,7 +562,7 @@ func (s *Store) ClaimJob(ctx context.Context, id, workerID string, executionID i
 	defer tx.Rollback()
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ? FOR UPDATE`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, ErrNotFound
@@ -545,15 +587,18 @@ func (s *Store) ClaimJob(ctx context.Context, id, workerID string, executionID i
 	}); err != nil {
 		return Job{}, false, err
 	}
+	traceID, traceparent := currentTrace(ctx)
 	if _, err := tx.ExecContext(ctx, `UPDATE jobs_projection SET status = 'running',
 		worker_id = ?, execution_id = execution_id + 1,
-		lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND)
-		WHERE id = ?`, workerID, id); err != nil {
+		lease_expires_at = DATE_ADD(CURRENT_TIMESTAMP(6), INTERVAL 15 SECOND),
+		trace_id = COALESCE(NULLIF(?, ''), trace_id),
+		traceparent = COALESCE(NULLIF(?, ''), traceparent)
+		WHERE id = ?`, workerID, traceID, traceparent, id); err != nil {
 		return Job{}, false, fmt.Errorf("claim job: %w", err)
 	}
 	job, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ?`, id))
 	if err != nil {
 		return Job{}, false, fmt.Errorf("read claimed job: %w", err)
@@ -579,6 +624,10 @@ func terminal(status string) bool {
 }
 
 func appendEvent(ctx context.Context, tx *sql.Tx, jobID, eventType string, payload any) error {
+	return appendEventWithTraceID(ctx, tx, jobID, eventType, payload, "")
+}
+
+func appendEventWithTraceID(ctx context.Context, tx *sql.Tx, jobID, eventType string, payload any, traceID string) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("encode event payload: %w", err)
@@ -589,9 +638,12 @@ func appendEvent(ctx context.Context, tx *sql.Tx, jobID, eventType string, paylo
 	if err != nil {
 		return fmt.Errorf("get next event sequence: %w", err)
 	}
+	if traceID == "" {
+		traceID, _ = currentTrace(ctx)
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO job_events
-		(job_id, sequence_num, event_type, payload) VALUES (?, ?, ?, ?)`,
-		jobID, sequence, eventType, string(body)); err != nil {
+		(job_id, sequence_num, event_type, payload, trace_id) VALUES (?, ?, ?, ?, NULLIF(?, ''))`,
+		jobID, sequence, eventType, string(body), traceID); err != nil {
 		return fmt.Errorf("append %s event: %w", eventType, err)
 	}
 	return nil
@@ -603,12 +655,13 @@ type scanner interface {
 
 func scanJob(row scanner) (Job, error) {
 	var job Job
-	var workerID, result, failure sql.NullString
+	var workerID, result, failure, traceID, traceparent sql.NullString
 	var leaseExpiresAt sql.NullTime
 	err := row.Scan(&job.ID, &job.TenantID, &job.IdempotencyKey, &job.Command,
 		&job.CPU, &job.MemoryMB, &job.GPU, &job.Status, &workerID, &result, &failure,
-		&job.CreatedAt, &job.UpdatedAt, &job.ExecutionID, &leaseExpiresAt)
+		&job.CreatedAt, &job.UpdatedAt, &job.ExecutionID, &leaseExpiresAt, &traceID, &traceparent)
 	job.WorkerID, job.Result, job.Error = workerID.String, result.String, failure.String
+	job.TraceID, job.TraceParent = traceID.String, traceparent.String
 	if leaseExpiresAt.Valid {
 		job.LeaseExpiresAt = &leaseExpiresAt.Time
 	}
@@ -742,7 +795,7 @@ func (s *Store) reapExpiredJob(ctx context.Context, id string, maxRetries int) (
 	defer tx.Rollback()
 	job, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
-		created_at, updated_at, execution_id, lease_expires_at
+		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
 		FROM jobs_projection WHERE id = ?
 		AND status IN ('scheduled', 'leased', 'running')
 		AND lease_expires_at < CURRENT_TIMESTAMP(6) FOR UPDATE`, id))

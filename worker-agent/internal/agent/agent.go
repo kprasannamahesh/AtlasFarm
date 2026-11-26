@@ -15,6 +15,12 @@ import (
 
 	"github.com/kprasannamahesh/AtlasFarm/worker-agent/internal/executor"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Config struct {
@@ -55,7 +61,10 @@ type Agent struct {
 func New(config Config) *Agent {
 	return &Agent{
 		config: config,
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: otelhttp.NewTransport(http.DefaultTransport),
+		},
 		active: make(map[string]int64),
 	}
 }
@@ -192,18 +201,34 @@ func (a *Agent) execute(parent context.Context, delivery amqp.Delivery) error {
 		}
 		return errors.New("job message missing id or command")
 	}
+	carrier := propagation.MapCarrier{}
+	if value, ok := delivery.Headers["traceparent"].(string); ok {
+		carrier.Set("traceparent", value)
+	}
+	if value, ok := delivery.Headers["tracestate"].(string); ok {
+		carrier.Set("tracestate", value)
+	}
+	jobParent := otel.GetTextMapPropagator().Extract(parent, carrier)
+	jobCtx, span := otel.Tracer("atlasfarm/worker-agent").Start(
+		jobParent, "worker.execute",
+		trace.WithAttributes(attribute.String("job.id", job.ID), attribute.String("worker.id", a.config.ID)),
+	)
+	defer span.End()
 
 	started := map[string]any{
 		"status": "running", "worker_id": a.config.ID, "execution_id": job.ExecutionID,
 	}
 	var claim Job
-	if err := a.request(parent, http.MethodPost, "/v1/jobs/"+job.ID+"/status", started, &claim); err != nil {
+	if err := a.request(jobCtx, http.MethodPost, "/v1/jobs/"+job.ID+"/status", started, &claim); err != nil {
 		if errors.Is(err, ErrStaleExecution) {
 			if ackErr := delivery.Ack(false); ackErr != nil {
 				return fmt.Errorf("acknowledge stale job %s: %w", job.ID, ackErr)
 			}
+			span.SetStatus(codes.Error, "stale execution rejected")
 			return nil
 		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "report job start")
 		if nackErr := delivery.Nack(false, true); nackErr != nil {
 			return fmt.Errorf("report job start: %v; requeue message: %w", err, nackErr)
 		}
@@ -219,9 +244,9 @@ func (a *Agent) execute(parent context.Context, delivery amqp.Delivery) error {
 	a.setActive(job.ID, job.ExecutionID)
 	defer a.removeActive(job.ID)
 
-	jobCtx, cancel := context.WithTimeout(parent, a.config.JobTimeout)
+	executionCtx, cancel := context.WithTimeout(jobCtx, a.config.JobTimeout)
 	defer cancel()
-	output, executionErr := executor.Run(jobCtx, job.Command)
+	output, executionErr := executor.Run(executionCtx, job.Command)
 	status := "succeeded"
 	report := map[string]any{
 		"status": status, "worker_id": a.config.ID, "execution_id": job.ExecutionID, "result": output,
@@ -232,13 +257,16 @@ func (a *Agent) execute(parent context.Context, delivery amqp.Delivery) error {
 		report["result"] = output
 		report["error"] = executionErr.Error()
 	}
-	if err := a.request(parent, http.MethodPost, "/v1/jobs/"+job.ID+"/status", report, nil); err != nil {
+	if err := a.request(jobCtx, http.MethodPost, "/v1/jobs/"+job.ID+"/status", report, nil); err != nil {
 		if errors.Is(err, ErrStaleExecution) {
 			if ackErr := delivery.Ack(false); ackErr != nil {
 				return fmt.Errorf("acknowledge stale result for job %s: %w", job.ID, ackErr)
 			}
+			span.SetStatus(codes.Error, "stale execution rejected")
 			return nil
 		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "report job result")
 		if nackErr := delivery.Nack(false, true); nackErr != nil {
 			return fmt.Errorf("report job %s: %v; requeue message: %w", status, err, nackErr)
 		}
@@ -248,6 +276,8 @@ func (a *Agent) execute(parent context.Context, delivery amqp.Delivery) error {
 		return fmt.Errorf("acknowledge job %s: %w", job.ID, err)
 	}
 	if executionErr != nil {
+		span.RecordError(executionErr)
+		span.SetStatus(codes.Error, "command failed")
 		// A non-zero exit or timeout is an expected job outcome, not a worker failure.
 		return nil
 	}

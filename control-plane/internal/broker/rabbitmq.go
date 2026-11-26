@@ -10,6 +10,8 @@ import (
 
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/events"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 type RabbitMQ struct {
@@ -80,11 +82,18 @@ func (r *RabbitMQ) publish(ctx context.Context, routingKey string, job events.Jo
 	if err != nil {
 		return fmt.Errorf("encode job message: %w", err)
 	}
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	headers := make(amqp.Table, len(carrier))
+	for key, value := range carrier {
+		headers[key] = value
+	}
 	if err := r.channel.PublishWithContext(ctx, r.exchange, routingKey, false, false, amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
 		Timestamp:    time.Now().UTC(),
 		MessageId:    job.ID,
+		Headers:      headers,
 		Body:         body,
 	}); err != nil {
 		r.failure = err

@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS jobs_projection (
     error_message MEDIUMTEXT,
     lease_expires_at TIMESTAMP(6) NULL,
     trace_id VARCHAR(64),
+    traceparent VARCHAR(128),
     created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
         ON UPDATE CURRENT_TIMESTAMP(6),
@@ -69,6 +70,18 @@ CREATE TABLE IF NOT EXISTS jobs_projection (
     KEY idx_jobs_tenant_status (tenant_id, status),
     KEY idx_jobs_lease_expires_at (lease_expires_at),
     CONSTRAINT fk_jobs_tenant FOREIGN KEY (tenant_id) REFERENCES tenants (id)
+);
+
+CREATE TABLE IF NOT EXISTS rollouts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    target_version VARCHAR(64) NOT NULL,
+    canary_percentage INT NOT NULL,
+    error_threshold_pct DECIMAL(5,2) NOT NULL,
+    status ENUM('ACTIVE', 'ROLLED_BACK', 'COMPLETED') NOT NULL,
+    created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+    KEY idx_rollouts_status_created (status, created_at)
 );
 
 CREATE TABLE IF NOT EXISTS workers (

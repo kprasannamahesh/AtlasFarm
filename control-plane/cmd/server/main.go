@@ -18,7 +18,10 @@ import (
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/dispatch"
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/events"
 	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/lease"
+	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/rollout"
+	"github.com/kprasannamahesh/AtlasFarm/control-plane/internal/telemetry"
 	"github.com/kprasannamahesh/AtlasFarm/scheduler"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 func main() {
@@ -38,6 +41,33 @@ func main() {
 	}
 	startupCancel()
 
+	eventStore := events.New(db)
+	rolloutStore := rollout.New(db)
+	migrationCtx, migrationCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := eventStore.Migrate(migrationCtx); err != nil {
+		migrationCancel()
+		log.Fatalf("migrate event store: %v", err)
+	}
+	if err := rolloutStore.Migrate(migrationCtx); err != nil {
+		migrationCancel()
+		log.Fatalf("migrate rollout store: %v", err)
+	}
+	migrationCancel()
+
+	traceCtx, traceCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownTracing, err := telemetry.Setup(traceCtx, "atlasfarm-control-plane")
+	traceCancel()
+	if err != nil {
+		log.Fatalf("initialize OpenTelemetry: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Printf("shutdown OpenTelemetry: %v", err)
+		}
+	}()
+
 	queue := env("RABBITMQ_QUEUE", "jobs")
 	publisher, rabbitConn, err := broker.Connect(env("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:25672/"), queue)
 	if err != nil {
@@ -52,17 +82,17 @@ func main() {
 		}
 	}()
 
-	eventStore := events.New(db)
 	packer, err := scheduler.NewBinPackerFromEnv()
 	if err != nil {
 		log.Fatalf("configure scheduler: %v", err)
 	}
 	cluster := scheduler.NewClusterState()
-	dispatcher := dispatch.New(eventStore, publisher, cluster, packer)
+	dispatcher := dispatch.New(eventStore, publisher, cluster, packer, rolloutStore)
 	reaper := lease.NewReaper(eventStore, cluster, lease.DefaultMaxRetries)
+	rolloutWatcher := rollout.NewWatcher(rolloutStore)
 
 	mux := http.NewServeMux()
-	apiHandler := api.NewHandler(eventStore, publisher, cluster)
+	apiHandler := api.NewHandlerWithRollouts(eventStore, publisher, rolloutStore, cluster)
 	apiRoutes := apiHandler.Routes()
 	mux.Handle("/v1/", apiRoutes)
 	mux.Handle("/api/v1/", http.StripPrefix("/api", apiRoutes))
@@ -93,7 +123,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              env("HTTP_ADDR", ":8080"),
-		Handler:           mux,
+		Handler:           otelhttp.NewHandler(withConsoleCORS(mux), "atlasfarm-control-plane"),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -101,6 +131,7 @@ func main() {
 	defer stop()
 	go dispatcher.Run(ctx)
 	go reaper.Run(ctx)
+	go rolloutWatcher.Run(ctx)
 
 	serverErrors := make(chan error, 1)
 	go func() {
@@ -127,4 +158,21 @@ func env(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func withConsoleCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin == "http://localhost:5173" || origin == "http://127.0.0.1:5173" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Idempotency-Key")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

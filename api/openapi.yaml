@@ -120,6 +120,40 @@ paths:
           description: Invalid active lease list
         '404':
           description: Worker not found
+  /v1/rollouts/current:
+    get:
+      summary: Get the most recently configured rollout
+      responses:
+        '200':
+          description: Current rollout configuration and status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Rollout'
+        '404':
+          description: No rollout has been configured
+  /v1/rollouts:
+    post:
+      summary: Configure a canary rollout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRollout'
+      responses:
+        '201':
+          description: Rollout created
+        '400':
+          description: Invalid rollout request
+  /v1/rollouts/rollback:
+    post:
+      summary: Manually roll back the active rollout
+      responses:
+        '200':
+          description: Rollout rolled back and canary traffic set to zero
+        '404':
+          description: No active rollout
 components:
   parameters:
     JobID:
@@ -196,3 +230,36 @@ components:
         execution_id:
           type: integer
           format: int64
+    CreateRollout:
+      type: object
+      required: [target_version, canary_percentage, error_threshold_pct]
+      properties:
+        target_version:
+          type: string
+          maxLength: 64
+        canary_percentage:
+          type: integer
+          minimum: 0
+          maximum: 100
+        error_threshold_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+    Rollout:
+      allOf:
+        - $ref: '#/components/schemas/CreateRollout'
+        - type: object
+          required: [id, status, created_at, updated_at]
+          properties:
+            id:
+              type: integer
+              format: int64
+            status:
+              type: string
+              enum: [ACTIVE, ROLLED_BACK, COMPLETED]
+            created_at:
+              type: string
+              format: date-time
+            updated_at:
+              type: string
+              format: date-time

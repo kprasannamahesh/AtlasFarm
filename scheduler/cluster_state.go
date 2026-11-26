@@ -27,6 +27,7 @@ type WorkerState struct {
 	UsedMemoryMB  int64
 	TotalGPU      int
 	UsedGPU       int
+	RunnerVersion string
 	Status        string
 }
 

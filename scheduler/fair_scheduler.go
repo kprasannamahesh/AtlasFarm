@@ -6,9 +6,10 @@ import (
 )
 
 type Job struct {
-	ID       string
-	TenantID string
-	Request  ResourceRequest
+	ID          string
+	TenantID    string
+	Request     ResourceRequest
+	TraceParent string
 }
 
 type FairScheduler struct {

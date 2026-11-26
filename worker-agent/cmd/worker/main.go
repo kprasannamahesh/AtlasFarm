@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/kprasannamahesh/AtlasFarm/worker-agent/internal/agent"
+	"github.com/kprasannamahesh/AtlasFarm/worker-agent/internal/telemetry"
 )
 
 func main() {
@@ -49,6 +50,19 @@ func main() {
 	if len(workerID) > 36 {
 		log.Fatal("worker ID must be at most 36 characters")
 	}
+	traceCtx, traceCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownTracing, err := telemetry.Setup(traceCtx, "atlasfarm-worker-agent")
+	traceCancel()
+	if err != nil {
+		log.Fatalf("initialize OpenTelemetry: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := shutdownTracing(ctx); err != nil {
+			log.Printf("shutdown OpenTelemetry: %v", err)
+		}
+	}()
 	config := agent.Config{
 		ID: workerID, ControlPlaneURL: *controlPlane, RabbitMQURL: *rabbitMQ,
 		Queue: *queue, CPU: *cpu, MemoryMB: int64(*memory), GPU: *gpu,
