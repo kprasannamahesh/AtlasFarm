@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	mysql "github.com/go-sql-driver/mysql"
 )
 
 func TestCreateJobAppendsInitialEventTransactionally(t *testing.T) {
@@ -45,6 +46,40 @@ func TestCreateJobAppendsInitialEventTransactionally(t *testing.T) {
 	}
 }
 
+func TestCreateJobRetriesMySQLDeadlock(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	store := New(db)
+
+	expectCreateLookup(mock, time.Now(), "job-1", "queued", "")
+	mock.ExpectQuery("SELECT COALESCE\\(MAX\\(sequence_num\\), 0\\) \\+ 1").
+		WithArgs("job-1").WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(1))
+	mock.ExpectExec("INSERT INTO job_events").
+		WillReturnError(&mysql.MySQLError{Number: 1213, Message: "Deadlock found when trying to get lock"})
+	mock.ExpectRollback()
+
+	expectCreateLookup(mock, time.Now(), "job-1", "queued", "")
+	mock.ExpectQuery("SELECT COALESCE\\(MAX\\(sequence_num\\), 0\\) \\+ 1").
+		WithArgs("job-1").WillReturnRows(sqlmock.NewRows([]string{"sequence"}).AddRow(1))
+	mock.ExpectExec("INSERT INTO job_events").
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectCommit()
+
+	job, created, err := store.CreateJob(context.Background(), CreateJobRequest{
+		ID: "job-1", TenantID: "tenant-1", IdempotencyKey: "request-1",
+		Command: "go test ./...", CPU: 2, MemoryMB: 2048,
+	})
+	if err != nil || !created || job.ID != "job-1" {
+		t.Fatalf("CreateJob() = (%+v, created=%v, err=%v), want retried creation", job, created, err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateJobIsIdempotent(t *testing.T) {
 	db, mock, err := sqlmock.New()
 	if err != nil {
@@ -53,6 +88,9 @@ func TestCreateJobIsIdempotent(t *testing.T) {
 	defer db.Close()
 	store := New(db)
 	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT max_cpu").WithArgs("tenant-1").
+		WillReturnRows(sqlmock.NewRows([]string{"max_cpu", "max_ram_mb", "max_gpu", "max_concurrent_jobs"}).
+			AddRow(64, int64(131072), 8, 100))
 	mock.ExpectQuery("WHERE idempotency_key = \\?").WithArgs("request-1").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "tenant_id", "idempotency_key", "command",
 			"req_cpu", "req_memory_mb", "req_gpu", "status", "worker_id", "result", "error_message",
@@ -400,18 +438,18 @@ func TestCreateJobRollsBackWhenEventAppendFails(t *testing.T) {
 
 func expectCreateLookup(mock sqlmock.Sqlmock, now time.Time, id, status, traceID string) {
 	mock.ExpectBegin()
+	mock.ExpectQuery("SELECT max_cpu").WithArgs("tenant-1").
+		WillReturnRows(sqlmock.NewRows([]string{"max_cpu", "max_ram_mb", "max_gpu", "max_concurrent_jobs"}).
+			AddRow(64, int64(131072), 8, 100))
 	emptyJobRows := func() *sqlmock.Rows {
 		return sqlmock.NewRows([]string{"id", "tenant_id", "idempotency_key", "command",
 			"req_cpu", "req_memory_mb", "req_gpu", "status", "worker_id", "result", "error_message",
 			"created_at", "updated_at", "execution_id", "lease_expires_at"})
 	}
 	mock.ExpectQuery("WHERE idempotency_key = \\?").WithArgs("request-1").WillReturnRows(emptyJobRows())
-	mock.ExpectQuery("SELECT max_cpu").WithArgs("tenant-1").
-		WillReturnRows(sqlmock.NewRows([]string{"max_cpu", "max_ram_mb", "max_gpu", "max_concurrent_jobs"}).
-			AddRow(64, int64(131072), 8, 100))
 	mock.ExpectQuery("SELECT COALESCE\\(SUM\\(req_cpu\\)").WithArgs("tenant-1").
 		WillReturnRows(sqlmock.NewRows([]string{"cpu", "memory", "gpu", "jobs"}).AddRow(0, int64(0), 0, 0))
-	mock.ExpectQuery("WHERE idempotency_key = \\? FOR UPDATE").WithArgs("request-1").WillReturnRows(emptyJobRows())
+	mock.ExpectQuery("WHERE idempotency_key = \\?").WithArgs("request-1").WillReturnRows(emptyJobRows())
 	mock.ExpectExec("INSERT IGNORE INTO jobs_projection").
 		WithArgs(id, "tenant-1", "request-1", "go test ./...", 2, int64(2048), 0, traceID, "").
 		WillReturnResult(sqlmock.NewResult(1, 1))

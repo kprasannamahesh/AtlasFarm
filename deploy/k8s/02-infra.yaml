@@ -1,0 +1,328 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: atlasfarm-mysql-data
+  namespace: atlasfarm
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlasfarm-mysql
+  namespace: atlasfarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atlasfarm-mysql
+  template:
+    metadata:
+      labels:
+        app: atlasfarm-mysql
+    spec:
+      containers:
+        - name: mysql
+          image: mysql:8.0
+          args: ["--innodb-buffer-pool-size=256M"]
+          ports:
+            - name: mysql
+              containerPort: 3306
+          env:
+            - name: MYSQL_DATABASE
+              value: atlasfarm
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: atlasfarm-credentials
+                  key: MYSQL_ROOT_PASSWORD
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 -p$MYSQL_ROOT_PASSWORD"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "mysqladmin ping -h 127.0.0.1 -p$MYSQL_ROOT_PASSWORD"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: init-sql
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: atlasfarm-mysql-data
+        - name: init-sql
+          configMap:
+            name: atlasfarm-mysql-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlasfarm-mysql
+  namespace: atlasfarm
+spec:
+  selector:
+    app: atlasfarm-mysql
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: mysql
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlasfarm-rabbitmq
+  namespace: atlasfarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atlasfarm-rabbitmq
+  template:
+    metadata:
+      labels:
+        app: atlasfarm-rabbitmq
+    spec:
+      containers:
+        - name: rabbitmq
+          image: rabbitmq:3-management-alpine
+          ports:
+            - name: amqp
+              containerPort: 5672
+            - name: management
+              containerPort: 15672
+          env:
+            - name: RABBITMQ_DEFAULT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: atlasfarm-credentials
+                  key: RABBITMQ_DEFAULT_USER
+            - name: RABBITMQ_DEFAULT_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: atlasfarm-credentials
+                  key: RABBITMQ_DEFAULT_PASS
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["rabbitmq-diagnostics", "-q", "ping"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlasfarm-rabbitmq
+  namespace: atlasfarm
+spec:
+  selector:
+    app: atlasfarm-rabbitmq
+  ports:
+    - name: amqp
+      port: 5672
+      targetPort: amqp
+    - name: management
+      port: 15672
+      targetPort: management
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: atlasfarm-prometheus-config
+  namespace: atlasfarm
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+      - job_name: atlasfarm
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [atlasfarm]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: atlasfarm-control-plane|atlasfarm-worker
+          - source_labels: [__meta_kubernetes_pod_container_port_name]
+            action: keep
+            regex: http|metrics
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: job
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: atlasfarm-prometheus
+  namespace: atlasfarm
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: atlasfarm-prometheus
+  namespace: atlasfarm
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: atlasfarm-prometheus
+  namespace: atlasfarm
+subjects:
+  - kind: ServiceAccount
+    name: atlasfarm-prometheus
+    namespace: atlasfarm
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: atlasfarm-prometheus
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlasfarm-prometheus
+  namespace: atlasfarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atlasfarm-prometheus
+  template:
+    metadata:
+      labels:
+        app: atlasfarm-prometheus
+    spec:
+      serviceAccountName: atlasfarm-prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=7d
+          ports:
+            - name: http
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: atlasfarm-prometheus-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlasfarm-prometheus
+  namespace: atlasfarm
+spec:
+  selector:
+    app: atlasfarm-prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlasfarm-jaeger
+  namespace: atlasfarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atlasfarm-jaeger
+  template:
+    metadata:
+      labels:
+        app: atlasfarm-jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.62.0
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            - name: ui
+              containerPort: 16686
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: ui
+            initialDelaySeconds: 10
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlasfarm-jaeger
+  namespace: atlasfarm
+spec:
+  selector:
+    app: atlasfarm-jaeger
+  ports:
+    - name: ui
+      port: 16686
+      targetPort: ui
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http

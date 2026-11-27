@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,6 +27,9 @@ import (
 )
 
 func main() {
+	enablePprof := flag.Bool("enable-pprof", true, "enable runtime profiling endpoints (disable on untrusted networks)")
+	flag.Parse()
+
 	dsn := env("DATABASE_DSN", "root:atlasfarm-local@tcp(127.0.0.1:3306)/atlasfarm?parseTime=true")
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -32,10 +37,10 @@ func main() {
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(50)
-	db.SetMaxIdleConns(10)
+	db.SetMaxIdleConns(50)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	startupCtx, startupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := db.PingContext(startupCtx); err != nil {
+	if err := pingDatabase(startupCtx, db); err != nil {
 		startupCancel()
 		log.Fatalf("connect to MySQL: %v", err)
 	}
@@ -69,16 +74,13 @@ func main() {
 	}()
 
 	queue := env("RABBITMQ_QUEUE", "jobs")
-	publisher, rabbitConn, err := broker.Connect(env("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:25672/"), queue)
+	publisher, _, err := broker.Connect(env("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:25672/"), queue)
 	if err != nil {
 		log.Fatalf("connect to RabbitMQ: %v", err)
 	}
 	defer func() {
 		if err := publisher.Close(); err != nil {
 			log.Printf("close RabbitMQ channel: %v", err)
-		}
-		if err := rabbitConn.Close(); err != nil {
-			log.Printf("close RabbitMQ connection: %v", err)
 		}
 	}()
 
@@ -107,7 +109,7 @@ func main() {
 			http.Error(w, "database unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if rabbitConn.IsClosed() || publisher.IsClosed() {
+		if publisher.IsClosed() {
 			http.Error(w, "message broker unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -120,6 +122,15 @@ func main() {
 		_, _ = w.Write([]byte(cluster.Utilization().Prometheus()))
 		_, _ = fmt.Fprintf(w, "# HELP atlasfarm_stale_commits_rejected_total Lifecycle callbacks rejected for stale execution tokens.\n# TYPE atlasfarm_stale_commits_rejected_total counter\natlasfarm_stale_commits_rejected_total %d\n", apiHandler.StaleCommitsRejected())
 	})
+	if *enablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		mux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+		mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+	}
 
 	server := &http.Server{
 		Addr:              env("HTTP_ADDR", ":8080"),
@@ -132,6 +143,7 @@ func main() {
 	go dispatcher.Run(ctx)
 	go reaper.Run(ctx)
 	go rolloutWatcher.Run(ctx)
+	go publisher.RunReconnectLoop(ctx)
 
 	serverErrors := make(chan error, 1)
 	go func() {
@@ -149,6 +161,27 @@ func main() {
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Fatalf("shutdown control plane: %v", err)
+		}
+	}
+}
+
+func pingDatabase(ctx context.Context, db *sql.DB) error {
+	backoff := 50 * time.Millisecond
+	for {
+		if err := db.PingContext(ctx); err == nil {
+			return nil
+		} else {
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return fmt.Errorf("ping MySQL: %w", err)
+			}
+		}
+		if backoff < 250*time.Millisecond {
+			backoff *= 2
+			if backoff > 250*time.Millisecond {
+				backoff = 250 * time.Millisecond
+			}
 		}
 	}
 }

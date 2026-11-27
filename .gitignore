@@ -22,6 +22,8 @@ coverage/
 /deploy/data/
 /deploy/volumes/
 *.log
+/docs/profiles/*
+!/docs/profiles/.gitkeep
 
 # Editors and operating systems
 .DS_Store

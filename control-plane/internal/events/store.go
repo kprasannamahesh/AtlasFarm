@@ -134,6 +134,14 @@ func newID() (string, error) {
 }
 
 func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool, error) {
+	result, err := withTxRetry(ctx, s.db, deadlockMaxRetries, func() (jobOperationResult, error) {
+		job, created, err := s.createJobOnce(ctx, req)
+		return jobOperationResult{job: job, changed: created}, err
+	})
+	return result.job, result.changed, err
+}
+
+func (s *Store) createJobOnce(ctx context.Context, req CreateJobRequest) (Job, bool, error) {
 	if strings.TrimSpace(req.TenantID) == "" || strings.TrimSpace(req.IdempotencyKey) == "" ||
 		len(req.TenantID) > 36 || len(req.IdempotencyKey) > 128 ||
 		(req.ID != "" && len(req.ID) > 36) ||
@@ -155,10 +163,15 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 	}
 	defer tx.Rollback()
 
+	limits, err := quota.LockTenant(ctx, tx, req.TenantID)
+	if err != nil {
+		return Job{}, false, err
+	}
+
 	existing, err := scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
 		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
-		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
+		FROM jobs_projection WHERE idempotency_key = ?`, req.IdempotencyKey))
 	if err == nil {
 		if err := tx.Commit(); err != nil {
 			return Job{}, false, fmt.Errorf("commit duplicate job lookup: %w", err)
@@ -168,7 +181,7 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 	if !errors.Is(err, sql.ErrNoRows) {
 		return Job{}, false, fmt.Errorf("check existing idempotency key: %w", err)
 	}
-	if err := quota.CheckTransaction(ctx, tx, req.TenantID, quota.Request{
+	if err := quota.CheckTransactionWithLimits(ctx, tx, req.TenantID, limits, quota.Request{
 		CPU: req.CPU, MemoryMB: req.MemoryMB, GPU: req.GPU,
 	}); err != nil {
 		return Job{}, false, err
@@ -180,7 +193,7 @@ func (s *Store) CreateJob(ctx context.Context, req CreateJobRequest) (Job, bool,
 	existing, err = scanJob(tx.QueryRowContext(ctx, `SELECT id, tenant_id, idempotency_key, command,
 		req_cpu, req_memory_mb, req_gpu, status, worker_id, result, error_message,
 		created_at, updated_at, execution_id, lease_expires_at, trace_id, traceparent
-		FROM jobs_projection WHERE idempotency_key = ? FOR UPDATE`, req.IdempotencyKey))
+		FROM jobs_projection WHERE idempotency_key = ?`, req.IdempotencyKey))
 	if err == nil {
 		if err := tx.Commit(); err != nil {
 			return Job{}, false, fmt.Errorf("commit duplicate job lookup: %w", err)
@@ -291,6 +304,14 @@ func (s *Store) TenantWeights(ctx context.Context) (map[string]int, error) {
 }
 
 func (s *Store) ScheduleJob(ctx context.Context, id, workerID string) (Job, bool, error) {
+	result, err := withTxRetry(ctx, s.db, deadlockMaxRetries, func() (jobOperationResult, error) {
+		job, scheduled, err := s.scheduleJobOnce(ctx, id, workerID)
+		return jobOperationResult{job: job, changed: scheduled}, err
+	})
+	return result.job, result.changed, err
+}
+
+func (s *Store) scheduleJobOnce(ctx context.Context, id, workerID string) (Job, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("begin job scheduling: %w", err)
@@ -458,6 +479,20 @@ func (s *Store) TransitionJobWithExecution(
 	executionID int64,
 	output, failure string,
 ) (Job, bool, error) {
+	result, err := withTxRetry(ctx, s.db, deadlockMaxRetries, func() (jobOperationResult, error) {
+		job, changed, err := s.transitionJobWithExecutionOnce(
+			ctx, id, status, workerID, executionID, output, failure)
+		return jobOperationResult{job: job, changed: changed}, err
+	})
+	return result.job, result.changed, err
+}
+
+func (s *Store) transitionJobWithExecutionOnce(
+	ctx context.Context,
+	id, status, workerID string,
+	executionID int64,
+	output, failure string,
+) (Job, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Job{}, false, fmt.Errorf("begin job transition: %w", err)
@@ -552,6 +587,14 @@ func (s *Store) TransitionJobWithExecution(
 }
 
 func (s *Store) ClaimJob(ctx context.Context, id, workerID string, executionID int64) (Job, bool, error) {
+	result, err := withTxRetry(ctx, s.db, deadlockMaxRetries, func() (jobOperationResult, error) {
+		job, claimed, err := s.claimJobOnce(ctx, id, workerID, executionID)
+		return jobOperationResult{job: job, changed: claimed}, err
+	})
+	return result.job, result.changed, err
+}
+
+func (s *Store) claimJobOnce(ctx context.Context, id, workerID string, executionID int64) (Job, bool, error) {
 	if strings.TrimSpace(workerID) == "" {
 		return Job{}, false, fmt.Errorf("%w: worker_id is required", ErrInvalidRequest)
 	}

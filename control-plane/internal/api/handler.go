@@ -217,7 +217,11 @@ func (h *Handler) job(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err != nil {
-			h.recordStaleCommit(err)
+			if errors.Is(err, events.ErrStaleExecution) {
+				h.recordStaleCommit(err)
+				writeError(w, http.StatusConflict, err)
+				return
+			}
 			h.storeError(w, err)
 			return
 		}

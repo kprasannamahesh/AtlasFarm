@@ -51,19 +51,36 @@ func Check(limits Limits, usage Usage, request Request) error {
 }
 
 func CheckTransaction(ctx context.Context, tx *sql.Tx, tenantID string, request Request) error {
+	limits, err := LockTenant(ctx, tx, tenantID)
+	if err != nil {
+		return err
+	}
+	return CheckTransactionWithLimits(ctx, tx, tenantID, limits, request)
+}
+
+func LockTenant(ctx context.Context, tx *sql.Tx, tenantID string) (Limits, error) {
 	var limits Limits
 	err := tx.QueryRowContext(ctx, `SELECT max_cpu, max_ram_mb, max_gpu, max_concurrent_jobs
 		FROM tenants WHERE id = ? FOR UPDATE`, tenantID).Scan(
 		&limits.CPU, &limits.MemoryMB, &limits.GPU, &limits.ConcurrentJobs)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: %q", ErrTenantNotFound, tenantID)
+		return Limits{}, fmt.Errorf("%w: %q", ErrTenantNotFound, tenantID)
 	}
 	if err != nil {
-		return fmt.Errorf("load tenant quota: %w", err)
+		return Limits{}, fmt.Errorf("load tenant quota: %w", err)
 	}
+	return limits, nil
+}
 
+func CheckTransactionWithLimits(
+	ctx context.Context,
+	tx *sql.Tx,
+	tenantID string,
+	limits Limits,
+	request Request,
+) error {
 	var usage Usage
-	err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(req_cpu), 0),
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(req_cpu), 0),
 		COALESCE(SUM(req_memory_mb), 0), COALESCE(SUM(req_gpu), 0), COUNT(*)
 		FROM jobs_projection
 		WHERE tenant_id = ? AND status IN ('scheduled', 'leased', 'running')`,

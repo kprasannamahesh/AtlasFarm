@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -70,6 +71,28 @@ func New(config Config) *Agent {
 }
 
 func (a *Agent) Run(ctx context.Context) error {
+	delay := time.Second
+	for {
+		err := a.runSession(ctx)
+		if ctx.Err() != nil || err == nil {
+			return nil
+		}
+		log.Printf("worker agent session failed: %v; reconnecting in %s", err, delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		}
+		delay *= 2
+		if delay > 30*time.Second {
+			delay = 30 * time.Second
+		}
+	}
+}
+
+func (a *Agent) runSession(ctx context.Context) error {
 	connection, err := amqp.Dial(a.config.RabbitMQURL)
 	if err != nil {
 		return fmt.Errorf("connect to RabbitMQ: %w", err)

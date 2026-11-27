@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlasfarm-worker-cpu
+  namespace: atlasfarm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: atlasfarm-worker
+      pool: cpu
+  template:
+    metadata:
+      labels:
+        app: atlasfarm-worker
+        pool: cpu
+    spec:
+      nodeSelector:
+        atlasfarm.io/pool: cpu
+      containers:
+        - name: worker
+          image: atlasfarm/worker-agent:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - --control-plane=http://atlasfarm-control-plane:8080
+            - --cpu=2
+            - --memory=2048
+            - --gpu=0
+            - --version=v1.0.0
+            - --concurrency=1
+          envFrom:
+            - configMapRef:
+                name: atlasfarm-config
+            - secretRef:
+                name: atlasfarm-credentials
+          ports:
+            - name: metrics
+              containerPort: 9091
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlasfarm-worker-gpu
+  namespace: atlasfarm
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: atlasfarm-worker
+      pool: gpu
+  template:
+    metadata:
+      labels:
+        app: atlasfarm-worker
+        pool: gpu
+    spec:
+      nodeSelector:
+        atlasfarm.io/gpu: "true"
+      containers:
+        - name: worker
+          image: atlasfarm/worker-agent:local
+          imagePullPolicy: IfNotPresent
+          args:
+            - --control-plane=http://atlasfarm-control-plane:8080
+            - --cpu=4
+            - --memory=4096
+            - --gpu=1
+            - --version=v1.0.0-gpu
+            - --concurrency=1
+          envFrom:
+            - configMapRef:
+                name: atlasfarm-config
+            - secretRef:
+                name: atlasfarm-credentials
+          ports:
+            - name: metrics
+              containerPort: 9091
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 15
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlasfarm-worker-metrics
+  namespace: atlasfarm
+spec:
+  clusterIP: None
+  selector:
+    app: atlasfarm-worker
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: metrics

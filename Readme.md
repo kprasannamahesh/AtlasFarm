@@ -207,11 +207,87 @@ provides job submission, event/trace inspection, active/offline worker controls,
 and rollout configuration. See [web-console/README.md](web-console/README.md)
 for local UI instructions. The complete API schema is in [api/openapi.yaml](api/openapi.yaml).
 
-## Performance & Reliability Benchmarks
+## Sprint 5: Chaos, Kind, and Performance Workflows
 
-No reproducible throughput, latency, or recovery benchmark results are currently
-published. The repository includes a `k6/` directory for load-test work; record
-environment, command, and measured results here when those tests have been run.
+These are local development tools. Chaos tests restart the local Compose
+RabbitMQ/MySQL services and forcibly terminate temporary worker processes.
+Benchmarks create persistent job records and can leave queued work. Do not run
+either against a shared or production environment.
+
+### Chaos recovery suite
+
+Start Compose infrastructure and the control plane in separate terminals:
+
+```powershell
+docker compose -f deploy/docker-compose.yml up -d
+go -C control-plane run ./cmd/server
+```
+
+After `http://localhost:8080/readyz` returns HTTP 200, run the suite from the
+repository root:
+
+```powershell
+.\scripts\chaos\run-chaos-suite.ps1
+```
+
+It verifies worker-crash lease recovery and `JOB_RETRIED`, RabbitMQ reconnect,
+MySQL reconnect, and HTTP 409 fencing of an outdated execution token. It builds
+and starts temporary workers itself. The worker-crash case requires no active
+canary rollout so it can reliably target its capacity-matched worker. Job/event
+records remain in MySQL after the run.
+
+### Kind deployment
+
+Prerequisites: Docker, Kind, kubectl, and Go 1.22+. From the repository root:
+
+```powershell
+.\scripts\deploy-kind.ps1
+```
+
+The script creates or reuses the `atlasfarm` Kind cluster, generates a local
+credential for its Secret, creates the MySQL initialization ConfigMap, builds
+and loads both Go images, applies the manifests, and waits for pods to become
+Ready. It labels the local Kind node for the demo CPU and simulated GPU pools;
+this does not provide physical GPU access. HPA CPU metrics require
+metrics-server, which is not installed by the script. Existing credentials are
+reused on subsequent runs. `-Recreate` deletes and rebuilds the local cluster,
+including its local database volume.
+
+To access local services:
+
+```powershell
+kubectl port-forward -n atlasfarm svc/atlasfarm-control-plane 8080:8080
+kubectl port-forward -n atlasfarm svc/atlasfarm-jaeger 16686:16686
+```
+
+The manifests are a single-node development baseline, not a production HA
+deployment. See [docs/architecture.md](docs/architecture.md) for system
+boundaries and [docs/reliability.md](docs/reliability.md) for recovery
+assumptions.
+
+### k6 and pprof benchmarks
+
+Start the Compose services and the control plane with its default profiling
+configuration, then run:
+
+```powershell
+.\scripts\run-benchmarks.ps1
+```
+
+The runner captures pre/post goroutine and heap profiles in `docs/profiles/`,
+then runs the 10,000-job workload with k6 or a bounded-concurrency Go fallback.
+The verified Option A local Docker Desktop run accepted all 10,000 jobs with no
+errors or deadlocks; all four chaos recovery scenarios passed.
+
+| Throughput | p50 latency | p95 latency | p99 latency | Post-load heap |
+| ---: | ---: | ---: | ---: | ---: |
+| 129.63 jobs/sec | 44.48 ms | 629.63 ms | 684.78 ms | 0.93 MB |
+
+Use the local default p99 limit (`-MaxP99Ms 1000`) for Docker Desktop/WSL2
+storage variability. The production p99 target remains below 25 ms; this local
+run does not meet it. Profiles are git-ignored. The load test persists jobs, so
+use a disposable development database. See [docs/benchmarks.md](docs/benchmarks.md)
+for full results, pprof comparisons, methodology, and scaling analysis.
 
 ---
 
@@ -223,14 +299,15 @@ atlasfarm/
 ├── control-plane/          # Go control-plane module
 ├── scheduler/              # Go resource-aware scheduling module
 ├── worker-agent/           # Go worker module
-├── deploy/                 # Local infrastructure and observability configs
+├── deploy/                 # Compose stack and Kind Kubernetes manifests
 ├── helm/atlasfarm/         # Kubernetes Helm chart
 ├── k6/                     # Load tests
-├── scripts/chaos/          # Local chaos scripts
+├── scripts/                # Chaos, benchmark, and Kind deployment helpers
 ├── dashboards/             # Grafana dashboard placeholders
 ├── proto/                  # Worker protocol placeholder
 ├── web-console/            # React + TypeScript operations console
-└── docs/                   # Architecture, scheduler, and reliability docs
+└── docs/                   # Architecture, scheduler, reliability, benchmarks
+    └── profiles/           # Local pprof artifacts (git-ignored)
 ```
 
 ---
@@ -239,8 +316,9 @@ atlasfarm/
 
 AtlasFarm is an evolving development platform. The local Compose stack provides
 MySQL, RabbitMQ, Prometheus, Grafana, Loki, and Jaeger; it does not containerize
-the Go services. Helm chart templates, dashboards, and some docs are starter
-artifacts rather than a complete production deployment. There is no configured
+the Go services. The Kind manifests are intended for local validation and
+demonstration, not high availability or production security. Helm chart
+templates and dashboards remain starter artifacts. There is no configured
 dead-letter queue, DAG orchestrator, Elasticsearch/Fluent Bit pipeline, or
 Prometheus-driven rollout controller in the current implementation. Rollout
 decisions use job outcomes recorded in MySQL.

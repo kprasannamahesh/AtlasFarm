@@ -2,8 +2,6 @@ module github.com/kprasannamahesh/AtlasFarm/worker-agent
 
 go 1.22.0
 
-toolchain go1.23.5
-
 require (
 	github.com/rabbitmq/amqp091-go v1.17.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.57.0

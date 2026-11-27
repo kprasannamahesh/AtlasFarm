@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: atlasfarm-control-plane
+  namespace: atlasfarm
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: atlasfarm-control-plane
+  template:
+    metadata:
+      labels:
+        app: atlasfarm-control-plane
+    spec:
+      containers:
+        - name: control-plane
+          image: atlasfarm/control-plane:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: atlasfarm-config
+            - secretRef:
+                name: atlasfarm-credentials
+          args: ["--enable-pprof=false"]
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: atlasfarm-control-plane
+  namespace: atlasfarm
+spec:
+  selector:
+    app: atlasfarm-control-plane
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: atlasfarm-control-plane
+  namespace: atlasfarm
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: atlasfarm-control-plane
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: atlasfarm-control-plane
+  namespace: atlasfarm
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: atlasfarm-control-plane
